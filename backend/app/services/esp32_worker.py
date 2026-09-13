@@ -716,7 +716,6 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
     _chip_timer_runtimes: list = []         # runtimes with active timers
     _chip_pin_watch_runtimes: list = []     # runtimes that called vx_pin_watch
 
-
     # ePaper SSD168x slaves keyed by frontend component_id. The slave decodes
     # SPI bytes; on MASTER_ACTIVATION it emits an `epaper_update` WS frame.
     # `dc_pin` / `cs_pin` / `rst_pin` (gpio numbers) are tracked via

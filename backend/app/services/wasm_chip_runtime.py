@@ -200,7 +200,8 @@ class WasmChipRuntime:
             pin_reader: (gpio) → 0/1 — reads current GPIO state from QEMU. If absent,
                         vx_pin_read returns the runtime's last-known cached value.
             uart_writer: (uart_id, bytes) → void — injects bytes into the firmware's
-                         UART RX. Called by vx_uart_write, always with CHIP_UART.
+                         UART RX. Called by vx_uart_write with the UART this chip
+                         resolved to (see uart_map), CHIP_UART when none does.
             timer_scheduler: callback invoked when the chip arms a timer; the worker
                              starts the actual scheduling thread.
             net_map:    {chip_pin_name: net_id} - chip pins that share a diagram net

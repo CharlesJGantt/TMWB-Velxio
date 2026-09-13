@@ -128,7 +128,11 @@ PartSimulationRegistry.register('custom-chip', {
       for (const name of pins) {
         if (!name) continue;
         const gpio = getArduinoPin(name);
-        if (gpio !== null && gpio >= 0) pinMap[name] = gpio;
+        // Synthetic pin numbers (100000+) are a browser-side PinManager key for
+        // a chip pin with no board GPIO on its net. They are not GPIOs, and the
+        // worker would hand one straight to qemu_picsimlab_set_pin. Such a pin
+        // belongs to `nets` below, or to nothing at all.
+        if (gpio !== null && gpio >= 0 && !isSyntheticChipPin(gpio)) pinMap[name] = gpio;
       }
 
       // Chip-to-chip nets. A pin wired only to another chip's pin has no GPIO
