@@ -223,9 +223,13 @@ _chip_net_bus: list = [None]
 
 
 def _get_chip_net_bus(chip_net_bus_cls):
-    """Lazily build the worker's ChipNetBus."""
+    """Lazily build the worker's ChipNetBus. A level change on a net whose
+    members live in another worker is published as a `chip_net` event; the
+    frontend interconnect relays it to the peer board's worker."""
     if _chip_net_bus[0] is None:
-        _chip_net_bus[0] = chip_net_bus_cls()
+        def _publish(net_id: str, level: int, ts_ns: int) -> None:
+            _emit({'type': 'chip_net', 'net': net_id, 'level': level, 'ts': ts_ns})
+        _chip_net_bus[0] = chip_net_bus_cls(publisher=_publish)
     return _chip_net_bus[0]
 
 
@@ -2114,6 +2118,10 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                         net_bus    = None
                         if net_map:
                             net_bus = _get_chip_net_bus(ChipNetBus)
+                            net_bus.mark_remote(
+                                str(n['net']) for n in nets
+                                if n.get('net') and n.get('remote')
+                            )
 
                         # ── Plumbing: hook the runtime to QEMU's live peripherals ──
                         # GPIO output: chip's vx_pin_write → qemu_picsimlab_set_pin
@@ -2304,6 +2312,25 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                     _lock_iothread(b'esp32_worker.py:set_pin', 0)
                 try:
                     lib.qemu_picsimlab_set_pin(int(cmd['pin']) + 1, int(cmd['value']))
+                finally:
+                    if _unlock_iothread:
+                        _unlock_iothread()
+
+        elif c == 'chip_net':
+            # A chip on another board drove a net this board's chips share.
+            # Same lock discipline as set_pin: the fan-out runs the receiving
+            # chip's vx_pin_watch callback, which may call vx_pin_write and so
+            # re-enter QEMU from this thread.
+            bus = _chip_net_bus[0]
+            if bus is not None:
+                if _lock_iothread:
+                    _lock_iothread(b'esp32_worker.py:chip_net', 0)
+                try:
+                    bus.apply_remote(str(cmd.get('net', '')),
+                                     int(cmd.get('level', 0)),
+                                     int(cmd.get('ts', 0)))
+                except Exception as e:
+                    _log(f'[custom-chip chip_net] error: {e!r}')
                 finally:
                     if _unlock_iothread:
                         _unlock_iothread()

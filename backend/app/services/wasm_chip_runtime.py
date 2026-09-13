@@ -85,11 +85,26 @@ class ChipNetBus:
     Net ids are opaque strings minted by the frontend (chipNets.ts canonical
     endpoint key), so both ends of a net agree on the name without the worker
     having to see the diagram.
+
+    A net whose members live in different QEMU workers is bridged by the
+    frontend: `publisher` is called on every local level change for such a net,
+    and `apply_remote` replays the peer's changes here.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        publisher: Optional[Callable[[str, int, int], None]] = None,
+    ) -> None:
+        """
+        Args:
+            publisher: (net_id, level, ts_ns) -> void, called for a net marked
+                       remote when a local member drives it. None keeps the bus
+                       local to this worker.
+        """
+        self._publisher = publisher
         self._levels: dict[str, int] = {}
         self._members: dict[str, list[tuple["WasmChipRuntime", int]]] = {}
+        self._remote: set[str] = set()
         # Re-entrancy guard: a watch callback may drive the same net straight
         # back. The nested write still sets the level, it just does not fan out
         # a second time, so a chip cannot recurse the worker to death.
@@ -99,6 +114,14 @@ class ChipNetBus:
         self._members.setdefault(net_id, []).append((runtime, handle))
         self._levels.setdefault(net_id, 0)
 
+    def mark_remote(self, net_ids) -> None:
+        """Flag nets that have a member in another worker, so local writes are
+        published to the frontend bridge."""
+        self._remote.update(str(n) for n in net_ids)
+
+    def is_remote(self, net_id: str) -> bool:
+        return net_id in self._remote
+
     def level(self, net_id: str) -> int | None:
         return self._levels.get(net_id)
 
@@ -107,10 +130,19 @@ class ChipNetBus:
         net_id: str,
         value: int,
         source: Optional[tuple["WasmChipRuntime", int]] = None,
+        publish: bool = True,
+        ts_ns: int | None = None,
     ) -> None:
         """Set the net level and fire every other member's pin watches."""
         v = 1 if value else 0
         self._levels[net_id] = v
+        if publish and self._publisher is not None and net_id in self._remote:
+            try:
+                self._publisher(
+                    net_id, v, ts_ns if ts_ns is not None else time.monotonic_ns()
+                )
+            except Exception:
+                pass
         if net_id in self._driving:
             return
         self._driving.add(net_id)
@@ -121,6 +153,12 @@ class ChipNetBus:
                 runtime.notify_net_change(handle, v)
         finally:
             self._driving.discard(net_id)
+
+    def apply_remote(self, net_id: str, value: int, ts_ns: int = 0) -> None:
+        """Replay a level change a peer worker drove. Never republished, so two
+        bridged workers cannot ping-pong one edge forever."""
+        del ts_ns  # carried for diagnostics; arrival order is what drives here
+        self.drive(net_id, value, source=None, publish=False)
 
 
 class WasmChipRuntime:
