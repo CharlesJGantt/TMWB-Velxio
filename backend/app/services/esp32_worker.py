@@ -214,6 +214,21 @@ def _log(msg: str) -> None:
     sys.stderr.flush()
 
 
+# ─── Custom-chip net bus ────────────────────────────────────────────────────
+# One bus per worker, shared by every custom chip on this board, so a chip pin
+# wired only to another chip's pin still carries a level. Created on the first
+# chip that ships a `nets` list; older frontends send none, the bus stays None
+# and the GPIO-only behaviour is exactly what it was.
+_chip_net_bus: list = [None]
+
+
+def _get_chip_net_bus(chip_net_bus_cls):
+    """Lazily build the worker's ChipNetBus."""
+    if _chip_net_bus[0] is None:
+        _chip_net_bus[0] = chip_net_bus_cls()
+    return _chip_net_bus[0]
+
+
 # ─── GPIO pinmap (identity: slot i → GPIO i-1) ──────────────────────────────
 # ESP32 has 40 GPIOs (0-39), ESP32-C3 only has 22 (0-21).
 # The pinmap is rebuilt after reading config (see main()), defaulting to ESP32.
@@ -670,6 +685,7 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
     _chip_spi_runtimes:  list = []          # runtimes that called vx_spi_attach
     _chip_timer_runtimes: list = []         # runtimes with active timers
     _chip_pin_watch_runtimes: list = []     # runtimes that called vx_pin_watch
+
 
     # ePaper SSD168x slaves keyed by frontend component_id. The slave decodes
     # SPI bytes; on MASTER_ACTIVATION it emits an `epaper_update` WS frame.
@@ -2056,7 +2072,7 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                 # as the hardcoded slaves above.
                 # See docs/wiki/custom-chips-esp32-backend-runtime.md
                 try:
-                    from app.services.wasm_chip_runtime import WasmChipRuntime
+                    from app.services.wasm_chip_runtime import ChipNetBus, WasmChipRuntime
                     from app.services.wasm_chip_slave   import WasmChipI2CSlave
                 except ImportError:
                     # Fallback: same pattern as esp32_i2c_slaves at the top of
@@ -2070,6 +2086,7 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                     _mod_rt = importlib.util.module_from_spec(_spec_rt)
                     _spec_rt.loader.exec_module(_mod_rt)
                     WasmChipRuntime = _mod_rt.WasmChipRuntime
+                    ChipNetBus = _mod_rt.ChipNetBus
                     _spec_sl = importlib.util.spec_from_file_location(
                         'wasm_chip_slave', _here / 'wasm_chip_slave.py'
                     )
@@ -2087,6 +2104,16 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                         wasm_bytes = base64.b64decode(wasm_b64)
                         attrs      = s.get('attrs', {}) or {}
                         pin_map    = s.get('pin_map', {}) or {}
+                        # Chip-to-chip nets, resolved by the frontend with the
+                        # same union-find chipNets.ts runs for browser boards.
+                        # Each entry: {'pin': <chip pin>, 'net': <net id>,
+                        # 'remote': bool}. Absent on older frontends.
+                        nets       = s.get('nets', []) or []
+                        net_map    = {str(n['pin']): str(n['net'])
+                                      for n in nets if n.get('pin') and n.get('net')}
+                        net_bus    = None
+                        if net_map:
+                            net_bus = _get_chip_net_bus(ChipNetBus)
 
                         # ── Plumbing: hook the runtime to QEMU's live peripherals ──
                         # GPIO output: chip's vx_pin_write → qemu_picsimlab_set_pin
@@ -2130,6 +2157,8 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                             pin_reader=_chip_pin_reader,
                             uart_writer=_chip_uart_writer,
                             timer_scheduler=_chip_timer_scheduler,
+                            net_map=net_map,
+                            net_bus=net_bus,
                         )
                         runtime.run_chip_setup()
 
@@ -2149,6 +2178,9 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                         if runtime.has_pin_watches():
                             _chip_pin_watch_runtimes.append(runtime)
                             _log(f"[custom-chip] pin watches registered: {list(runtime._pin_watches.keys())}")
+                        if net_map:
+                            _log(f"[custom-chip] chip nets: {net_map} "
+                                 f"watching={runtime.has_net_watches()}")
                         if (runtime.i2c_address is None and runtime.uart_config is None
                                 and runtime.spi_config is None):
                             _log("[custom-chip] WASM loaded but no I2C/UART/SPI peripherals declared "

@@ -23,6 +23,7 @@ import { useElectricalStore } from '../../store/useElectricalStore';
 import { normalizeChipPinNames } from '../customChips/chipJson';
 import { clearChipDrives } from '../customChips/chipPinDrives';
 import { isSyntheticChipPin } from '../customChips/syntheticPins';
+import { resolveChipNetMembers } from '../customChips/chipNets';
 import { requestElectricalResolve } from '../spice/electricalResolveHook';
 import { runChipAttachExtensions } from '../customChips/chipAttachExtensions';
 import { createUartBitBanger, type UartBitBanger } from '../customChips/uartBitBang';
@@ -129,6 +130,12 @@ PartSimulationRegistry.register('custom-chip', {
         if (gpio !== null && gpio >= 0) pinMap[name] = gpio;
       }
 
+      // Chip-to-chip nets. A pin wired only to another chip's pin has no GPIO
+      // and so is absent from pinMap; the worker's ChipNetBus carries it
+      // instead, and `remote` marks a net whose other end is a chip on a
+      // different board (a second QEMU worker) for the interconnect to bridge.
+      const nets = resolveChipNetMembers(useSimulatorStore.getState(), componentId);
+
       // Synthetic slot — backend doesn't index custom-chip sensors by pin.
       const virtualPin = 0xFF;
       try {
@@ -136,9 +143,10 @@ PartSimulationRegistry.register('custom-chip', {
           wasm_b64: wasmBase64,
           attrs: attrsObj,
           pin_map: pinMap,
+          nets,
         });
         console.info(
-          `[custom-chip:${componentId}] sent to backend ESP32 worker (chip runs synchronously inside QEMU process). pinMap=${JSON.stringify(pinMap)}`,
+          `[custom-chip:${componentId}] sent to backend ESP32 worker (chip runs synchronously inside QEMU process). pinMap=${JSON.stringify(pinMap)} nets=${JSON.stringify(nets)}`,
         );
       } catch (e) {
         console.error(`[custom-chip:${componentId}] failed to register on ESP32 backend:`, e);
