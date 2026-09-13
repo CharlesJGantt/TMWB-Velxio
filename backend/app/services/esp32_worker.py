@@ -1465,18 +1465,19 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
         if _stopped.is_set():
             return
         _emit({'type': 'uart_tx', 'uart': uart_id, 'byte': byte_val})
-        # Dispatch to any custom-chip runtimes that declared a UART, but only
-        # from CHIP_UART. UART0 is the serial monitor: feeding it to a chip
-        # means the chip receives the sketch's own console output, and the
-        # chip's replies land in the monitor as garbage. Chips live on
-        # Serial1, which is what the browser bridge does too.
+        # Dispatch to the custom-chip runtimes bound to THIS UART. A chip binds
+        # to the UART whose TX/RX the diagram wires to it, and to CHIP_UART when
+        # nothing resolves: UART0 is the serial monitor, so a chip listening
+        # there by default would receive the sketch's own console output and its
+        # replies would land in the monitor as garbage.
         # The chip's on_rx_byte callback runs synchronously in this thread.
-        if uart_id == CHIP_UART:
-            for rt in _chip_uart_runtimes:
-                try:
-                    rt.feed_uart_byte(byte_val)
-                except Exception as e:
-                    _log(f'[custom-chip uart_tx] error: {e!r}')
+        for rt in _chip_uart_runtimes:
+            if getattr(rt, 'uart_id', CHIP_UART) != uart_id:
+                continue
+            try:
+                rt.feed_uart_byte(byte_val)
+            except Exception as e:
+                _log(f'[custom-chip uart_tx] error: {e!r}')
         # Crash / reboot detection on UART0 only
         if uart_id == 0:
             _uart0_buf.append(byte_val)
@@ -2113,6 +2114,11 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                         # Each entry: {'pin': <chip pin>, 'net': <net id>,
                         # 'remote': bool}. Absent on older frontends.
                         nets       = s.get('nets', []) or []
+                        # {gpio: uart_id} for the UART pins the diagram wires to
+                        # this chip, so vx_uart_attach binds to the UART the
+                        # sketch actually talks on. Absent on older frontends.
+                        uart_map   = {int(k): int(v)
+                                      for k, v in (s.get('uart_map', {}) or {}).items()}
                         net_map    = {str(n['pin']): str(n['net'])
                                       for n in nets if n.get('pin') and n.get('net')}
                         net_bus    = None
@@ -2167,6 +2173,7 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                             timer_scheduler=_chip_timer_scheduler,
                             net_map=net_map,
                             net_bus=net_bus,
+                            uart_map=uart_map,
                         )
                         runtime.run_chip_setup()
 
@@ -2178,7 +2185,7 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                             _log(f"[custom-chip] I2C slave registered at 0x{runtime.i2c_address:02x}")
                         if runtime.uart_config is not None:
                             _chip_uart_runtimes.append(runtime)
-                            _log("[custom-chip] UART chip registered on UART0")
+                            _log(f"[custom-chip] UART chip registered on UART{runtime.uart_id}")
                         if runtime.spi_config is not None:
                             _chip_spi_runtimes.append(runtime)
                             _sync_cs_events()

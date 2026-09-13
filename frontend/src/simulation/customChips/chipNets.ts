@@ -259,6 +259,19 @@ function chipOwnerBoard(idx: ChipNetIndex, chipId: string): string | null {
 }
 
 /**
+ * The board a chip belongs to: the board its pins reach through the wires.
+ * Null for a chip wired to no board at all (a board-less canvas, or a chip
+ * wired only to other chips). Used to pick the UART pin table for the chip's
+ * board and to tell a cross-worker net from a local one.
+ */
+export function resolveChipOwnerBoardId(
+  state: ChipNetState,
+  componentId: string,
+): string | null {
+  return chipOwnerBoard(getChipNetIndex(state), componentId);
+}
+
+/**
  * Every pin of `componentId` that shares a net with another chip pin, with the
  * net id the worker keys its fan-out on. Unlike resolveChipNetKey this does NOT
  * skip nets that carry a board pin: on the backend the GPIO behaviour stays and

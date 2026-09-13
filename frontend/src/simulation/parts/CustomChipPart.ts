@@ -23,7 +23,8 @@ import { useElectricalStore } from '../../store/useElectricalStore';
 import { normalizeChipPinNames } from '../customChips/chipJson';
 import { clearChipDrives } from '../customChips/chipPinDrives';
 import { isSyntheticChipPin } from '../customChips/syntheticPins';
-import { resolveChipNetMembers } from '../customChips/chipNets';
+import { resolveChipNetMembers, resolveChipOwnerBoardId } from '../customChips/chipNets';
+import { classifyPin } from '../../utils/boardProtocols';
 import { requestElectricalResolve } from '../spice/electricalResolveHook';
 import { runChipAttachExtensions } from '../customChips/chipAttachExtensions';
 import { createUartBitBanger, type UartBitBanger } from '../customChips/uartBitBang';
@@ -136,6 +137,27 @@ PartSimulationRegistry.register('custom-chip', {
       // different board (a second QEMU worker) for the interconnect to bridge.
       const nets = resolveChipNetMembers(useSimulatorStore.getState(), componentId);
 
+      // Which board UART each wired GPIO belongs to. The chip's vx_uart_attach
+      // names its own RX/TX pins, and the backend runtime turns those into
+      // GPIOs through pinMap; this table is the last hop, GPIO to UART number,
+      // and it is board-specific so it has to come from here. Without it every
+      // chip landed on one fixed UART whatever the diagram said, which put a
+      // module wired to Serial2 on the wrong end of the board.
+      const uartMap: Record<number, number> = {};
+      {
+        const st = useSimulatorStore.getState();
+        const ownerId = resolveChipOwnerBoardId(st, componentId);
+        const ownerKind = st.boards.find((b) => b.id === ownerId)?.boardKind;
+        if (ownerKind) {
+          for (const gpio of Object.values(pinMap)) {
+            const role = classifyPin(ownerKind, String(gpio));
+            if (role.kind === 'uart-tx' || role.kind === 'uart-rx') {
+              uartMap[gpio] = role.uart;
+            }
+          }
+        }
+      }
+
       // Synthetic slot — backend doesn't index custom-chip sensors by pin.
       const virtualPin = 0xFF;
       try {
@@ -144,9 +166,10 @@ PartSimulationRegistry.register('custom-chip', {
           attrs: attrsObj,
           pin_map: pinMap,
           nets,
+          uart_map: uartMap,
         });
         console.info(
-          `[custom-chip:${componentId}] sent to backend ESP32 worker (chip runs synchronously inside QEMU process). pinMap=${JSON.stringify(pinMap)} nets=${JSON.stringify(nets)}`,
+          `[custom-chip:${componentId}] sent to backend ESP32 worker (chip runs synchronously inside QEMU process). pinMap=${JSON.stringify(pinMap)} nets=${JSON.stringify(nets)} uartMap=${JSON.stringify(uartMap)}`,
         );
       } catch (e) {
         console.error(`[custom-chip:${componentId}] failed to register on ESP32 backend:`, e);
