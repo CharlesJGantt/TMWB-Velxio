@@ -233,6 +233,32 @@ def _get_chip_net_bus(chip_net_bus_cls):
     return _chip_net_bus[0]
 
 
+# One-way latency of the chip-net bridge in nanoseconds: [count, min, max, sum].
+# Both workers stamp with time.monotonic_ns and CLOCK_MONOTONIC is system-wide on
+# Linux, so the two processes read one clock and this subtraction is a real
+# one-way time rather than a clock offset. It is the floor under the bit period a
+# chip protocol can use across two boards, so it is worth stating rather than
+# leaving people to guess.
+_chip_net_rx_stats = [0, 0, 0, 0]
+
+
+def _note_chip_net_latency(ts_ns: int) -> None:
+    if ts_ns <= 0:
+        return
+    delta = time.monotonic_ns() - ts_ns
+    if delta < 0:
+        return
+    st = _chip_net_rx_stats
+    st[0] += 1
+    st[1] = delta if st[0] == 1 else min(st[1], delta)
+    st[2] = max(st[2], delta)
+    st[3] += delta
+    if st[0] % 200 == 0:
+        _log(f'[custom-chip chip_net] {st[0]} hops, one-way us: '
+             f'min={st[1] / 1000:.0f} avg={st[3] / st[0] / 1000:.0f} '
+             f'max={st[2] / 1000:.0f}')
+
+
 # ─── GPIO pinmap (identity: slot i → GPIO i-1) ──────────────────────────────
 # ESP32 has 40 GPIOs (0-39), ESP32-C3 only has 22 (0-21).
 # The pinmap is rebuilt after reading config (see main()), defaulting to ESP32.
@@ -2333,9 +2359,10 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                 if _lock_iothread:
                     _lock_iothread(b'esp32_worker.py:chip_net', 0)
                 try:
+                    ts_ns = int(cmd.get('ts', 0))
+                    _note_chip_net_latency(ts_ns)
                     bus.apply_remote(str(cmd.get('net', '')),
-                                     int(cmd.get('level', 0)),
-                                     int(cmd.get('ts', 0)))
+                                     int(cmd.get('level', 0)), ts_ns)
                 except Exception as e:
                     _log(f'[custom-chip chip_net] error: {e!r}')
                 finally:
