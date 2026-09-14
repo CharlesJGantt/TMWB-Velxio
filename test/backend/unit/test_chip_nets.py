@@ -129,6 +129,20 @@ def test_bus_publishes_only_nets_marked_remote():
     assert published == [('remote-net', 1, 1234)]
 
 
+def test_bus_unregister_drops_a_detached_member():
+    bus = ChipNetBus()
+    a, b, c = _StubMember(), _StubMember(), _StubMember()
+    bus.register('n', a, 0)
+    bus.register('n', b, 0)
+    bus.register('n', c, 0)
+    bus.unregister(b)
+    bus.drive('n', 1, source=(a, 0))
+    assert b.seen == []
+    assert c.seen == [(0, 1)]
+    # The net keeps its level for whoever asks.
+    assert bus.level('n') == 1
+
+
 def test_bus_never_republishes_what_a_peer_drove():
     """Otherwise two bridged workers would echo one edge back and forth."""
     published: list[tuple[str, int, int]] = []

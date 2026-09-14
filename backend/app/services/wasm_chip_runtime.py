@@ -114,6 +114,17 @@ class ChipNetBus:
         self._members.setdefault(net_id, []).append((runtime, handle))
         self._levels.setdefault(net_id, 0)
 
+    def unregister(self, runtime: "WasmChipRuntime") -> None:
+        """Drop every membership of `runtime` (a chip detached at runtime).
+        Nets it leaves empty keep their last level: the wire is still there,
+        only the driver left."""
+        for net_id, members in list(self._members.items()):
+            kept = [(rt, h) for rt, h in members if rt is not runtime]
+            if kept:
+                self._members[net_id] = kept
+            else:
+                del self._members[net_id]
+
     def mark_remote(self, net_ids) -> None:
         """Flag nets that have a member in another worker, so local writes are
         published to the frontend bridge."""
