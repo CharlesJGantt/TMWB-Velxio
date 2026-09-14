@@ -242,6 +242,22 @@ def _get_chip_net_bus(chip_net_bus_cls):
 _chip_net_rx_stats = [0, 0, 0, 0]
 
 
+# Time the command thread spends waiting for QEMU's iothread lock before it can
+# apply a bridged edge: [count, max_ns, sum_ns]. A slow lock here is a slow
+# net, whatever the bridge did.
+_chip_net_lock_stats = [0, 0, 0]
+
+
+def _note_chip_net_lock_wait(wait_ns: int) -> None:
+    st = _chip_net_lock_stats
+    st[0] += 1
+    st[1] = max(st[1], wait_ns)
+    st[2] += wait_ns
+    if st[0] % 200 == 0:
+        _log(f'[custom-chip chip_net] lock wait us over {st[0]} edges: '
+             f'avg={st[2] / st[0] / 1000:.0f} max={st[1] / 1000:.0f}')
+
+
 def _note_chip_net_latency(ts_ns: int) -> None:
     if ts_ns <= 0:
         return
@@ -2389,8 +2405,10 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
             # re-enter QEMU from this thread.
             bus = _chip_net_bus[0]
             if bus is not None:
+                _t_wait = time.monotonic_ns()
                 if _lock_iothread:
                     _lock_iothread(b'esp32_worker.py:chip_net', 0)
+                _note_chip_net_lock_wait(time.monotonic_ns() - _t_wait)
                 try:
                     ts_ns = int(cmd.get('ts', 0))
                     _note_chip_net_latency(ts_ns)

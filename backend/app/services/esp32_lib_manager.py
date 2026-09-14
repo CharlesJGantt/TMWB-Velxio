@@ -38,6 +38,7 @@ import asyncio
 import base64
 import dataclasses
 import json
+import time
 import logging
 import os
 import pathlib
@@ -483,11 +484,18 @@ class EspLibManager:
             # Count what the bridge hands this worker, so a lossy hop shows
             # up next to the worker's own "N hops" line.
             n = inst.chip_net_in = getattr(inst, 'chip_net_in', 0) + 1
-            if n % 200 == 0:
-                logger.info('[%s] chip_net: %d edges handed to the worker', client_id, n)
+            t0 = time.monotonic()
             self._write_cmd(inst, {
                 'cmd': 'chip_net', 'net': net, 'level': 1 if level else 0, 'ts': ts,
             })
+            dt_ms = (time.monotonic() - t0) * 1000.0
+            slow = getattr(inst, 'chip_net_slow_ms', 0.0)
+            if dt_ms > slow:
+                inst.chip_net_slow_ms = dt_ms
+            if n % 200 == 0:
+                logger.info('[%s] chip_net: %d edges handed to the worker, slowest pipe write %.1f ms',
+                            client_id, n, getattr(inst, 'chip_net_slow_ms', 0.0))
+                inst.chip_net_slow_ms = 0.0
 
     def sensor_detach(self, client_id: str, pin: int) -> None:
         """Remove a sensor from a GPIO pin."""
