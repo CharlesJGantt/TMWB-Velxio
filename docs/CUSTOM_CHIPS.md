@@ -218,9 +218,9 @@ Each is fully explained in
 
 - C SDK header — [`backend/sdk/velxio-chip.h`](../backend/sdk/velxio-chip.h)
 - Frontend runtime — [`frontend/src/simulation/customChips/`](../frontend/src/simulation/customChips/)
-- Example chips — [`test/test_custom_chips/sdk/examples/`](../test/test_custom_chips/sdk/examples/)
+- Example chips — [`frontend/src/components/customChips/examples/`](../frontend/src/components/customChips/examples/) (the ones the designer offers) and [`test/fixtures/chip-nets/`](../test/fixtures/chip-nets/) (two radio-style models with a chip-to-chip net)
 - Backend compile service — [`backend/app/services/chip_compile.py`](../backend/app/services/chip_compile.py)
-- Sandbox test suite — [`test/test_custom_chips/`](../test/test_custom_chips/)
+- Tests — [`frontend/src/__tests__/`](../frontend/src/__tests__/) (`chip*.test.ts`) and [`test/backend/unit/`](../test/backend/unit/) (`test_chip_*.py`); the Node sandbox suite moved to the maintainers' checkout, see the [build & test guide](./wiki/custom-chips-build-and-test.md#tests-in-this-repository)
 
 ---
 
