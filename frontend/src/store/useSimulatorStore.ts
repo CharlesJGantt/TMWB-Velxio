@@ -957,6 +957,24 @@ class Stm32BridgeShim {
     this.bridge.sendPinEvent(pin, state);
   }
 
+  /**
+   * The same thing under the name the custom-chip part keys on:
+   * `detectSimulatorKind` reads `sendPinEvent` as "a worker-backed board",
+   * and with it CustomChipPart ships a chip's WASM to this board's worker
+   * through registerSensor instead of running it in the browser with GPIO
+   * alone. The STM32 worker has hosted `custom-chip` sensors (I2C slave,
+   * pin watches, timers) since it was split from the ESP32 one; only this
+   * name was missing for a user's chip to reach it.
+   */
+  sendPinEvent(pin: number, state: boolean): void {
+    this.bridge.sendPinEvent(pin, state);
+  }
+
+  /** The STM32 worker hosts custom chips; see Esp32BridgeShim.hostsCustomChips. */
+  hostsCustomChips(): boolean {
+    return true;
+  }
+
   /** Raw-byte counterpart of `feedUart` — see the note on the ESP32 shim:
    *  feedUart is UTF-8 and mangles any byte >= 0x80, so binary protocols
    *  must use this. */
