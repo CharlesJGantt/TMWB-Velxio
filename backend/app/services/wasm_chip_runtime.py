@@ -158,9 +158,7 @@ class ChipNetBus:
         self._levels[net_id] = v
         if publish and self._publisher is not None and net_id in self._remote:
             try:
-                self._publisher(
-                    net_id, v, ts_ns if ts_ns is not None else self._clock()
-                )
+                self._publisher(net_id, v, self._stamp(ts_ns, source))
             except Exception:
                 pass
         if net_id in self._driving:
@@ -176,6 +174,22 @@ class ChipNetBus:
                     runtime.notify_net_change(handle, v, at_ns=at_ns)
         finally:
             self._driving.discard(net_id)
+
+    def _stamp(self, ts_ns: int | None, source) -> int:
+        """The instant a published edge carries. An explicit stamp wins; a
+        write from a chip's timer callback (or from a watch delivering a
+        stamped remote edge) carries the chip's own current instant, which is
+        the timer's deadline rather than the scheduler's wake-up time; anything
+        else is stamped with the bus clock."""
+        if ts_ns is not None:
+            return int(ts_ns)
+        if source is not None:
+            rt = source[0]
+            override = getattr(rt, "_now_override_ns", None)
+            t0 = getattr(rt, "_t0", None)
+            if override is not None and t0 is not None:
+                return int(t0) + int(override)
+        return int(self._clock())
 
     def apply_remote(self, net_id: str, value: int, ts_ns: int = 0) -> None:
         """Replay a level change a peer worker drove. Never republished, so two
@@ -1011,7 +1025,19 @@ class WasmChipRuntime:
                 if t["active"] and now >= t["next_fire_ns"]
             ]
         for _i, t in due:
-            self._call_indirect(t["cb_idx"], t["user_data"])
+            # The callback runs "at" its deadline: vx_sim_now_nanos answers the
+            # scheduled instant, not the moment the scheduler thread woke up.
+            # A periodic timer's deadlines are exact multiples of its period,
+            # so the edges a chip places from its callback are spaced exactly
+            # in that timeline whatever the host's wake-up lag was, and a net
+            # edge published from here is stamped with that instant (see
+            # ChipNetBus.drive) rather than with the lag.
+            prev_override = self._now_override_ns
+            self._now_override_ns = int(t["next_fire_ns"])
+            try:
+                self._call_indirect(t["cb_idx"], t["user_data"])
+            finally:
+                self._now_override_ns = prev_override
             with self._timer_lock:
                 if t["repeat"]:
                     t["next_fire_ns"] += t["period_ns"]
