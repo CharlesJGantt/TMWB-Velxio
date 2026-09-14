@@ -594,13 +594,26 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
 
     # Predicate: is the iothread lock currently held by this thread?
     # Used to avoid re-acquiring when we're already inside a QEMU callback
-    # (e.g., chip's vx_uart_write fired from inside _on_uart_tx).
-    try:
-        _iothread_locked = lib.qemu_mutex_iothread_locked
-        _iothread_locked.restype  = ctypes.c_bool
-        _iothread_locked.argtypes = []
-    except AttributeError:
-        _iothread_locked = None
+    # (e.g., chip's vx_uart_write fired from inside _on_uart_tx) or on a
+    # thread of ours that took the lock itself (chip_net, the timer thread).
+    # Same story as the lock pair above: the current fork exports the modern
+    # `bql_locked`, and asking only for the legacy name left this None, so a
+    # chip's vx_uart_write from a locked context re-locked the BQL and QEMU
+    # died with `bql_lock_impl: assertion failed: (!bql_locked())` the moment
+    # a custom chip answered on a UART (the KQ-130F receiver's first frame).
+    _iothread_locked = None
+    for locked_name in ('bql_locked', 'qemu_mutex_iothread_locked'):
+        try:
+            _iothread_locked = getattr(lib, locked_name)
+            _iothread_locked.restype  = ctypes.c_bool
+            _iothread_locked.argtypes = []
+            break
+        except AttributeError:
+            _iothread_locked = None
+    if _iothread_locked is None and _lock_iothread is not None:
+        _log('BQL "locked" predicate not found in libqemu (bql_locked / '
+             'qemu_mutex_iothread_locked) — a custom chip writing a UART from '
+             'a locked context will re-lock and abort QEMU.')
 
     # qemu_system_shutdown_request() schedules a clean shutdown from inside
     # the QEMU main-loop thread (which owns the AIO context).  Calling
