@@ -219,6 +219,19 @@ export class Esp32BridgeShim {
   }
 
   /**
+   * The same thing under the name the bridge uses. `detectSimulatorKind` in
+   * simulation/customChips/simulatorBridges.ts identifies an ESP32 host by
+   * this method, and says so in its own header comment, but the shim only
+   * ever had `setPinState`. So a custom chip on an ESP32 board was classified
+   * 'unknown' and took the browser chip runtime rather than the backend one:
+   * the chip ran in the tab while its firmware ran in QEMU, which is exactly
+   * the split docs/wiki/custom-chips-esp32-backend-runtime.md exists to avoid.
+   */
+  sendPinEvent(pin: number, state: boolean): void {
+    this.bridge.sendPinEvent(pin, state);
+  }
+
+  /**
    * Claim the decoded WS2812 frames going out on `pin` while the part is
    * attached. Returns the unsubscribe, like every other part subscription.
    */
