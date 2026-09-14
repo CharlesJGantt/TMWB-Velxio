@@ -18,6 +18,7 @@ import {
   getI2CBus,
   detectSimulatorKind,
 } from '../customChips';
+import { hostsChipsInWorker } from '../customChips/simulatorBridges';
 import { useSimulatorStore } from '../../store/useSimulatorStore';
 import { useElectricalStore } from '../../store/useElectricalStore';
 import { normalizeChipPinNames } from '../customChips/chipJson';
@@ -120,7 +121,15 @@ PartSimulationRegistry.register('custom-chip', {
     // RP2040 simulators also expose `registerSensor` for I2C sensor proxies —
     // taking that branch on AVR routes the chip to the (non-existent) ESP32
     // backend and the client-side ChipInstance never runs.
-    if (detectSimulatorKind(sim) === 'esp32' && typeof sim.registerSensor === 'function') {
+    //
+    // The same shim also fronts an overlay's in-browser ESP32 engine, which
+    // has no worker either: it answers hostsChipsInWorker() false and the
+    // chip takes the browser path below, like any other browser board.
+    if (
+      detectSimulatorKind(sim) === 'esp32' &&
+      typeof sim.registerSensor === 'function' &&
+      hostsChipsInWorker(sim)
+    ) {
       // Resolve each chip pin name → ESP32 GPIO via the diagram's wires. The
       // backend runtime uses this to call qemu_picsimlab_set_pin when the chip
       // does vx_pin_write, and to read live GPIO state for vx_pin_read.
@@ -228,7 +237,8 @@ PartSimulationRegistry.register('custom-chip', {
           componentId,
           pinManager: sim.pinManager,
           // Polymorphic I2C: AVR returns the I2CBusManager directly, RP2040
-          // returns a thin adapter, ESP32 returns null (chip won't get I2C).
+          // and a browser-hosted ESP32 (in-browser engine) a thin adapter,
+          // anything else null (chip won't get I2C).
           i2cBus: getI2CBus(sim, 0) as any,
           spiBus: bridges.spiBus,
           wires,

@@ -232,6 +232,24 @@ export class Esp32BridgeShim {
   }
 
   /**
+   * Whether custom chips wired to this board run in the bridge's backend
+   * worker (CustomChipPart ships the WASM with registerSensor) or in the
+   * browser runtime. The OSS QEMU bridge has no opinion and hosts them; an
+   * overlay's in-browser engine answers false, because a chip handed to it
+   * as a sensor would never run. Read by simulatorBridges.hostsChipsInWorker.
+   */
+  hostsCustomChips(): boolean {
+    const b = this.bridge as unknown as { hostsCustomChips?: () => boolean };
+    return typeof b.hostsCustomChips === 'function' ? b.hostsCustomChips() !== false : true;
+  }
+
+  /** One byte into the guest's UART RX; the custom-chip bridge (avrUartTx)
+   *  calls this for a browser-hosted chip's vx_uart_write on CHIP_UART. */
+  sendSerialByte(byte: number, uart = 0): void {
+    this.sendSerialBytes([byte & 0xff], uart);
+  }
+
+  /**
    * Claim the decoded WS2812 frames going out on `pin` while the part is
    * attached. Returns the unsubscribe, like every other part subscription.
    */
