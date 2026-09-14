@@ -1,15 +1,17 @@
 /*
- * SX1262 LoRa transceiver model for velxio custom chips.
+ * sx1262.c — Semtech SX1262 LoRa transceiver model.
  *
- * Scope: enough of the Semtech SX1262 command set that the xKoin gateway
- * driver (firmware/xkoin-gateway/lib/sx1262) believes a radio is present,
+ * Copyright (c) 2026 Martin Thuku. MIT licence (test/fixtures/chip-nets/LICENSE).
+ *
+ * Scope: enough of the SX1262 command set that a real SX1262 driver (the
+ * RadioLib / Semtech reference sequence) believes a radio is present,
  * plus a synthetic ANT pin that behaves as the air: the chip serialises its
  * TX buffer onto ANT as a Manchester bit stream, and every other SX1262
  * instance wired to the same ANT net decodes it into its RX buffer.
  *
  * This models command sequencing, buffers, IRQ latching and a shared medium.
  * It does NOT model LoRa modulation, spreading factors, airtime, sensitivity
- * or the link budget. See hardware/velxio/README.md for the full limits list.
+ * or the link budget. See docs/wiki/custom-chips-chip-nets.md for the limits.
  *
  * Portable C: velxio-chip.h plus stdint / stdlib / string only.
  *

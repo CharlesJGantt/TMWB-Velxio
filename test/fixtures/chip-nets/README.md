@@ -7,8 +7,8 @@ pin wired only to another chip's pin, and a chip UART that is not UART0.
 
 | Path | What it is |
 |---|---|
-| `sx1262/chip.c`, `chip.json` | SX1262 model: SPI slave plus a synthetic `ANT` pin |
-| `kq130f/chip.c`, `chip.json` | KQ-130F model: 9600 8N1 UART plus a synthetic `LINE` pin |
+| `../../../frontend/src/components/customChips/examples/sx1262.c`, `.chip.json` | SX1262 model: SPI slave plus a synthetic `ANT` pin (listed in the chip designer) |
+| `../../../frontend/src/components/customChips/examples/kq130f.c`, `.chip.json` | KQ-130F model: 9600 8N1 UART plus a synthetic `LINE` pin (listed in the chip designer) |
 | `chip_selftest.py` | 15 behavioural cases, run by hand inside a container |
 
 Both models carry a Manchester-coded, self-clocked bit stream on the synthetic
@@ -28,8 +28,8 @@ are supposed to do; `test/backend/unit/test_chip_nets.py` and
 a container:
 
     docker cp test/fixtures/chip-nets/chip_selftest.py velxio:/tmp/
-    docker cp test/fixtures/chip-nets/sx1262/chip.c velxio:/tmp/sx1262.c
-    docker cp test/fixtures/chip-nets/kq130f/chip.c velxio:/tmp/kq130f.c
+    docker cp frontend/src/components/customChips/examples/sx1262.c velxio:/tmp/sx1262.c
+    docker cp frontend/src/components/customChips/examples/kq130f.c velxio:/tmp/kq130f.c
     docker exec velxio sh -c 'for c in sx1262 kq130f; do /opt/wasi-sdk/bin/clang \
       --target=wasm32-unknown-wasip1 -O2 -nostartfiles -Wl,--import-memory \
       -Wl,--export-table -Wl,--no-entry -Wl,--export=chip_setup -Wl,--allow-undefined \

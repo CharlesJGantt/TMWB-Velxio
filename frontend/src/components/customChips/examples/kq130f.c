@@ -1,8 +1,10 @@
 /*
- * KQ-130F narrowband power line carrier model for velxio custom chips.
+ * kq130f.c — KQ-130F narrowband power-line carrier module model.
  *
- * Scope: the half duplex store and forward behaviour the xKoin gateway
- * firmware expects (firmware/xkoin-gateway/lib/kq130f). The module takes
+ * Copyright (c) 2026 Martin Thuku. MIT licence (test/fixtures/chip-nets/LICENSE).
+ *
+ * Scope: the half duplex store and forward behaviour a KQ-130F host sketch
+ * expects. The module takes
  * bytes on its UART RX at 9600 8N1, buffers them until the host stops
  * sending or the 128 byte payload limit is reached, then serialises the
  * buffer onto the synthetic LINE pin as one framed burst. Every other
@@ -10,7 +12,7 @@
  * and replays the bytes on its own UART TX once the frame is complete.
  *
  * It does NOT model OFDM or FSK carriers, mains coupling, zero cross timing,
- * impedance or attenuation. See hardware/velxio/README.md for the limits.
+ * impedance or attenuation. See docs/wiki/custom-chips-chip-nets.md for the limits.
  *
  * Portable C: velxio-chip.h plus stdint / stdlib / string only.
  *
