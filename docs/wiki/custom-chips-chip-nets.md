@@ -227,7 +227,8 @@ and is out of scope here.
 | `test/backend/unit/test_chip_nets.py` | 10 cases: bus semantics, then two real chips over LINE and ANT nets |
 | `test/backend/unit/test_chip_uart_binding.py` | 5 cases on the KQ-130F WASM |
 | `frontend/src/__tests__/chipnets-esp32-members.test.ts` | 9 cases on the net description sent to the worker |
-| `test/fixtures/chip-nets/` | SX1262 and KQ-130F models (MIT, Martin Thuku), sources, `.wasm`, standalone self test |
+| `test/fixtures/chip-nets/` | SX1262 and KQ-130F models (MIT, Martin Thuku), sources and a standalone self test |
 
-The `.wasm` fixtures were produced by `POST /api/compile-chip/` from the
-checked-in sources and are byte-identical to a fresh compile on the image.
+No `.wasm` is checked in: the pytest cases compile the sources through the
+backend's `ChipCompileService` (`test/backend/unit/chip_fixtures.py`) and
+skip where no wasi-sdk is installed.

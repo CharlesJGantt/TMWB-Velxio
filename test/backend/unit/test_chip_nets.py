@@ -36,9 +36,10 @@ pytest.importorskip('wasmtime', reason='chip runtime needs wasmtime')
 
 from app.services.wasm_chip_runtime import ChipNetBus, WasmChipRuntime  # noqa: E402
 
-FIXTURES = Path(__file__).parent.parent.parent / 'fixtures' / 'chip-nets'
-SX_WASM = FIXTURES / 'sx1262' / 'chip.wasm'
-KQ_WASM = FIXTURES / 'kq130f' / 'chip.wasm'
+# The fixture compiler sits next to this file; the unit directory is a
+# package, so it is reached by path rather than through pytest's rootdir.
+sys.path.insert(0, str(Path(__file__).parent))
+from chip_fixtures import chips_available, compiled_chip  # noqa: E402
 
 SX_BIT_US = 20.0    # chip.json defaults, so the tests prove the shipped values
 KQ_BIT_US = 200.0
@@ -146,8 +147,8 @@ def test_bus_never_republishes_what_a_peer_drove():
 # ── Layer 2: the chip models ─────────────────────────────────────────────────
 
 pytestmark_wasm = pytest.mark.skipif(
-    not (SX_WASM.is_file() and KQ_WASM.is_file()),
-    reason='chip-nets fixtures missing',
+    not chips_available(),
+    reason='wasi-sdk not available to compile the chip fixtures',
 )
 
 
@@ -186,7 +187,7 @@ class _Plc:
                   'label': label}
         values.update(attrs or {})
         self.rt = WasmChipRuntime(
-            KQ_WASM.read_bytes(),
+            compiled_chip('kq130f'),
             values,
             self._emit,
             pin_map={'TX': base_gpio, 'RX': base_gpio + 1},
@@ -330,7 +331,7 @@ class _Radio:
                   'bit_period_us': SX_BIT_US, 'label': label}
         values.update(attrs or {})
         self.rt = WasmChipRuntime(
-            SX_WASM.read_bytes(),
+            compiled_chip('sx1262'),
             values,
             lambda _payload: None,
             pin_map=self.map,

@@ -7,8 +7,8 @@ pin wired only to another chip's pin, and a chip UART that is not UART0.
 
 | Path | What it is |
 |---|---|
-| `sx1262/chip.c`, `chip.json`, `chip.wasm` | SX1262 model: SPI slave plus a synthetic `ANT` pin |
-| `kq130f/chip.c`, `chip.json`, `chip.wasm` | KQ-130F model: 9600 8N1 UART plus a synthetic `LINE` pin |
+| `sx1262/chip.c`, `chip.json` | SX1262 model: SPI slave plus a synthetic `ANT` pin |
+| `kq130f/chip.c`, `chip.json` | KQ-130F model: 9600 8N1 UART plus a synthetic `LINE` pin |
 | `chip_selftest.py` | 15 behavioural cases, run by hand inside a container |
 
 Both models carry a Manchester-coded, self-clocked bit stream on the synthetic
@@ -16,9 +16,10 @@ pin: `ANT` is the air, `LINE` is the mains. Every chip wired to the same net
 hears everything on it, collisions included, and a collision shows up as a
 failed CRC rather than as anything cleverer.
 
-The `.wasm` files were compiled by velxio's own `POST /api/compile-chip/`
-route, which is why they are checked in: the tests load them directly rather
-than needing a wasi-sdk on the machine running pytest.
+No `.wasm` is checked in: velxio compiles chips itself. The pytest cases
+compile `chip.c` through the backend's `ChipCompileService` (the same clang
+the `POST /api/compile-chip/` route runs; see `test/backend/unit/chip_fixtures.py`)
+and skip where no wasi-sdk is installed. The Docker image has one.
 
 `chip_selftest.py` is not collected by pytest. It is the standalone harness the
 models were developed against, kept here as the reference for what the chips
@@ -27,8 +28,12 @@ are supposed to do; `test/backend/unit/test_chip_nets.py` and
 a container:
 
     docker cp test/fixtures/chip-nets/chip_selftest.py velxio:/tmp/
-    docker cp test/fixtures/chip-nets/sx1262/chip.wasm velxio:/tmp/sx1262.wasm
-    docker cp test/fixtures/chip-nets/kq130f/chip.wasm velxio:/tmp/kq130f.wasm
+    docker cp test/fixtures/chip-nets/sx1262/chip.c velxio:/tmp/sx1262.c
+    docker cp test/fixtures/chip-nets/kq130f/chip.c velxio:/tmp/kq130f.c
+    docker exec velxio sh -c 'for c in sx1262 kq130f; do /opt/wasi-sdk/bin/clang \
+      --target=wasm32-unknown-wasip1 -O2 -nostartfiles -Wl,--import-memory \
+      -Wl,--export-table -Wl,--no-entry -Wl,--export=chip_setup -Wl,--allow-undefined \
+      -I /app/sdk /tmp/$c.c -o /tmp/$c.wasm; done'
     docker exec velxio python3 /tmp/chip_selftest.py
 
 ## Licence

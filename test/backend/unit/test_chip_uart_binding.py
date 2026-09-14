@@ -29,11 +29,13 @@ pytest.importorskip('wasmtime', reason='chip runtime needs wasmtime')
 
 from app.services.wasm_chip_runtime import CHIP_UART, WasmChipRuntime  # noqa: E402
 
-KQ_WASM = (Path(__file__).parent.parent.parent / 'fixtures' / 'chip-nets'
-           / 'kq130f' / 'chip.wasm')
+# The fixture compiler sits next to this file; the unit directory is a
+# package, so it is reached by path rather than through pytest's rootdir.
+sys.path.insert(0, str(Path(__file__).parent))
+from chip_fixtures import chips_available, compiled_chip  # noqa: E402
 
-pytestmark = pytest.mark.skipif(not KQ_WASM.is_file(),
-                                reason='chip-nets fixtures missing')
+pytestmark = pytest.mark.skipif(not chips_available(),
+                                reason='wasi-sdk not available to compile the chip fixtures')
 
 # The KQ-130F wiring in the xKoin proof: the module's RX is on the board's TX2
 # and its TX on the board's RX2. GPIO 17 is TX2 in the ESP32 UART table, GPIO 18
@@ -44,7 +46,7 @@ PIN_MAP = {'TX': 18, 'RX': 17}
 def _runtime(uart_map):
     sent: list[tuple[int, bytes]] = []
     rt = WasmChipRuntime(
-        KQ_WASM.read_bytes(),
+        compiled_chip('kq130f'),
         {'label': 'kq130f', 'bit_period_us': 200.0},
         lambda _payload: None,
         pin_map=PIN_MAP,
@@ -94,7 +96,7 @@ def test_writes_leave_on_the_bound_uart(monkeypatch):
     def _plc(label, base, uart_map):
         sent: list[tuple[int, bytes]] = []
         rt = WasmChipRuntime(
-            KQ_WASM.read_bytes(),
+            compiled_chip('kq130f'),
             {'label': label, 'bit_period_us': 200.0, 'line_noise_percent': 0.0},
             lambda _payload: None,
             pin_map={'TX': base, 'RX': base + 1},

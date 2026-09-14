@@ -9,8 +9,7 @@ velxio's board-level limits (see docs/wiki/custom-chips-chip-nets.md, "Limits").
 Usage (from the repo root, with the container named velxio running):
 
     docker cp test/fixtures/chip-nets/chip_selftest.py velxio:/tmp/
-    docker cp test/fixtures/chip-nets/sx1262/chip.wasm velxio:/tmp/sx1262.wasm
-    docker cp test/fixtures/chip-nets/kq130f/chip.wasm velxio:/tmp/kq130f.wasm
+    # compile the two models first (the .wasm is not checked in), see README.md
     docker exec velxio python3 /tmp/chip_selftest.py
 
 Exit code 0 means every case passed.
