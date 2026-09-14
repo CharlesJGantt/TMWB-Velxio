@@ -173,9 +173,15 @@ set that floor: the bridge's p99 of about 3 ms, and the sender's own timer
 thread, a `threading.Event.wait` loop that overshoots a 2.5 ms target to
 3.3 ms at p99. Both are host scheduling.
 
-**Rule of thumb: a bit-level protocol on a bridged chip net needs a bit
-period around 40 ms.** A frame-level bridge message is the obvious follow-up
-and is out of scope here.
+Those numbers were taken before edges carried a stamp. Since PR #324's
+follow-ups every published edge carries the sender's `CLOCK_MONOTONIC`
+instant (a timer callback stamps its scheduled deadline, not the thread's
+wake-up time) and the receiving chip sees the edge at that instant, so the
+hop's jitter no longer reaches the bit timing: on the same loaded host the
+KQ-130F pair delivered 7 of 7 frames at a 40 ms bit period with one-way
+latency between 9 ms and 65 ms. What still bounds a bridged protocol is
+throughput (each edge is two WebSocket messages) and ordering, which the
+sockets preserve.
 
 ## Limits that remain
 
