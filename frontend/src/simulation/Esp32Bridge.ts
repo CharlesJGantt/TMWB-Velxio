@@ -211,7 +211,7 @@ export class Esp32Bridge {
    * in another board's worker.  `ts` is the sender's monotonic nanosecond
    * clock, carried for diagnostics and ordering. The two workers do not share
    * an epoch, so only the differences between a sender's own timestamps are
-   * meaningful.  Wired by Interconnect.ts; see docs/xkoin-chip-nets.md.
+   * meaningful.  Wired by Interconnect.ts; see docs/wiki/custom-chips-chip-nets.md.
    */
   onChipNet: ((net: string, level: 0 | 1, ts: number) => void) | null = null;
   /** Internal pull config the guest programmed into IO_MUX (INPUT_PULLUP /

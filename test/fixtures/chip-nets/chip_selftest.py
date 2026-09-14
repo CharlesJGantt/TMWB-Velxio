@@ -1,16 +1,16 @@
-"""Functional self test for the xKoin velxio chip models.
+"""Functional self test for the chip-nets fixture models (SX1262, KQ-130F).
 
 Runs INSIDE the velxio container, driving the compiled chip.wasm through
 velxio's own runtime class (app.services.wasm_chip_runtime.WasmChipRuntime,
 the same class the ESP32 QEMU worker uses). No board, no QEMU: the harness
 plays the part of the wiring, so the models can be proven independently of
-velxio's board-level limits (see hardware/velxio/README.md, "Limits").
+velxio's board-level limits (see docs/wiki/custom-chips-chip-nets.md, "Limits").
 
 Usage (from the repo root, with the container named velxio running):
 
-    docker cp hardware/velxio/proof/chip_selftest.py velxio:/tmp/
-    docker cp hardware/velxio/chips/sx1262/chip.wasm velxio:/tmp/sx1262.wasm
-    docker cp hardware/velxio/chips/kq130f/chip.wasm velxio:/tmp/kq130f.wasm
+    docker cp test/fixtures/chip-nets/chip_selftest.py velxio:/tmp/
+    docker cp test/fixtures/chip-nets/sx1262/chip.wasm velxio:/tmp/sx1262.wasm
+    docker cp test/fixtures/chip-nets/kq130f/chip.wasm velxio:/tmp/kq130f.wasm
     docker exec velxio python3 /tmp/chip_selftest.py
 
 Exit code 0 means every case passed.

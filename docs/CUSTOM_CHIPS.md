@@ -211,6 +211,7 @@ Each is fully explained in
 | See the 11 chip examples worked through | [Examples walkthrough](./wiki/custom-chips-examples.md) |
 | Set up the toolchain or write tests | [Build & test guide](./wiki/custom-chips-build-and-test.md) |
 | Run custom chips on ESP32 (backend runtime architecture) | [ESP32 backend runtime](./wiki/custom-chips-esp32-backend-runtime.md) |
+| Wire two chips to each other on ESP32 boards, or across two boards | [Chip-to-chip nets](./wiki/custom-chips-chip-nets.md) |
 | Know which boards support which protocols | [Board support matrix](../test/autosearch/07_multi_board_support.md) |
 
 ### Quick links to source

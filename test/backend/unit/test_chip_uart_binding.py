@@ -10,7 +10,7 @@ built in the frontend from the board's UART pin table. The runtime resolves the
 chip's own vx_uart_config rx / tx pin handles through pin_map to GPIOs and then
 through uart_map to the UART number.
 
-Fixture: the xKoin KQ-130F, a 9600 8N1 module, in test/fixtures/xkoin.
+Fixture: the KQ-130F model, a 9600 8N1 module, in test/fixtures/chip-nets.
 
 Run from the repo root:
     pytest test/backend/unit/test_chip_uart_binding.py -v
@@ -29,11 +29,11 @@ pytest.importorskip('wasmtime', reason='chip runtime needs wasmtime')
 
 from app.services.wasm_chip_runtime import CHIP_UART, WasmChipRuntime  # noqa: E402
 
-KQ_WASM = (Path(__file__).parent.parent.parent / 'fixtures' / 'xkoin'
+KQ_WASM = (Path(__file__).parent.parent.parent / 'fixtures' / 'chip-nets'
            / 'kq130f' / 'chip.wasm')
 
 pytestmark = pytest.mark.skipif(not KQ_WASM.is_file(),
-                                reason='xkoin chip fixtures missing')
+                                reason='chip-nets fixtures missing')
 
 # The KQ-130F wiring in the xKoin proof: the module's RX is on the board's TX2
 # and its TX on the board's RX2. GPIO 17 is TX2 in the ESP32 UART table, GPIO 18

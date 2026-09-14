@@ -6,7 +6,7 @@ Two layers:
      exclusion, per-member edge detection, the re-entrancy guard, and the
      publish / apply path the cross-board bridge uses.
 
-  2. The real thing: the two xKoin chip models in test/fixtures/xkoin, whose
+  2. The real thing: the two chip models (SX1262 and KQ-130F, by Martin Thuku) in test/fixtures/chip-nets, whose
      `ANT` and `LINE` pins are wired only to each other and so have no board
      GPIO at all. Before the bus existed, vx_pin_watch dropped those watches
      and the net carried nothing on an ESP32 board. These cases drive a whole
@@ -15,7 +15,7 @@ Two layers:
 The models measure edge intervals, so the wasm cases run on VIRTUAL time: a
 clock the test advances to the next armed timer deadline, rather than the wall
 clock, whose scheduler jitter lands straight in those measurements. Same
-reason and same technique as test/fixtures/xkoin/chip_selftest.py.
+reason and same technique as test/fixtures/chip-nets/chip_selftest.py.
 
 Run from the repo root:
     pytest test/backend/unit/test_chip_nets.py -v
@@ -36,7 +36,7 @@ pytest.importorskip('wasmtime', reason='chip runtime needs wasmtime')
 
 from app.services.wasm_chip_runtime import ChipNetBus, WasmChipRuntime  # noqa: E402
 
-FIXTURES = Path(__file__).parent.parent.parent / 'fixtures' / 'xkoin'
+FIXTURES = Path(__file__).parent.parent.parent / 'fixtures' / 'chip-nets'
 SX_WASM = FIXTURES / 'sx1262' / 'chip.wasm'
 KQ_WASM = FIXTURES / 'kq130f' / 'chip.wasm'
 
@@ -147,7 +147,7 @@ def test_bus_never_republishes_what_a_peer_drove():
 
 pytestmark_wasm = pytest.mark.skipif(
     not (SX_WASM.is_file() and KQ_WASM.is_file()),
-    reason='xkoin chip fixtures missing',
+    reason='chip-nets fixtures missing',
 )
 
 

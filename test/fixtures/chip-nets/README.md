@@ -1,6 +1,6 @@
-# xKoin chip models, used as test fixtures
+# Chip-nets fixture models
 
-Two velxio custom chips written for the xKoin project, plus the functional
+Two velxio custom chips (SX1262 and KQ-130F models by Martin Thuku), plus the functional
 self test that drives them. They are here because they exercise the parts of
 the ESP32 custom-chip runtime that nothing else in this repository does: a
 pin wired only to another chip's pin, and a chip UART that is not UART0.
@@ -26,9 +26,9 @@ are supposed to do; `test/backend/unit/test_chip_nets.py` and
 `test_chip_uart_binding.py` are the pytest cases. To run the self test against
 a container:
 
-    docker cp test/fixtures/xkoin/chip_selftest.py velxio:/tmp/
-    docker cp test/fixtures/xkoin/sx1262/chip.wasm velxio:/tmp/sx1262.wasm
-    docker cp test/fixtures/xkoin/kq130f/chip.wasm velxio:/tmp/kq130f.wasm
+    docker cp test/fixtures/chip-nets/chip_selftest.py velxio:/tmp/
+    docker cp test/fixtures/chip-nets/sx1262/chip.wasm velxio:/tmp/sx1262.wasm
+    docker cp test/fixtures/chip-nets/kq130f/chip.wasm velxio:/tmp/kq130f.wasm
     docker exec velxio python3 /tmp/chip_selftest.py
 
 ## Licence

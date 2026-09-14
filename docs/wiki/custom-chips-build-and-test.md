@@ -418,7 +418,7 @@ peripheral callbacks fire **synchronously** in the QEMU thread:
 | `vx_pin_read` | Cached `_pin_state[gpio]` from `_on_pin_change` | Live |
 | `vx_pin_watch` | Dispatched from `_on_pin_change` (edge filtered) | Sync, lock held |
 | `vx_i2c_attach` | Registered as `_i2c_slaves[addr]` | `_on_i2c_event` |
-| `vx_uart_attach` / `vx_uart_write` | `_on_uart_tx` ↔ `qemu_picsimlab_uart_receive` | UART0 only |
+| `vx_uart_attach` / `vx_uart_write` | `_on_uart_tx` ↔ `qemu_picsimlab_uart_receive` | the UART the diagram wires (Serial1 when unwired) |
 | `vx_spi_attach` | Dispatched from `_on_spi_event` (op = `data << 8`) | Re-arm pattern supported |
 | `vx_timer_*` | Dedicated scheduler thread that takes the IO-thread lock | Wakes on soonest deadline |
 

@@ -400,7 +400,7 @@ function ensureSerialHook(entry: BoardEntry): void {
 // Cost: one WebSocket hop out and one back per edge, through the browser. That
 // is milliseconds, not microseconds, so a chip protocol carried this way needs
 // a bit period well above the round trip. Measured numbers and the bit period
-// they imply are in docs/xkoin-chip-nets.md.
+// they imply are in docs/wiki/custom-chips-chip-nets.md.
 //
 // No wire lookup is involved: the net id already names the net, both workers
 // were handed the same id by chipNets.ts, and a board with no member for that
