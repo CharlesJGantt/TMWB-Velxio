@@ -288,7 +288,13 @@ PartSimulationRegistry.register('custom-chip', {
         //     that pin, so SoftwareSerial(rx=that pin) actually receives.
         //     Before this, GPIO-wired chip streams (the NMEA GPS scenario)
         //     delivered nothing at all.
-        if (inst.hasUart) {
+        //
+        // An ESP32-kind simulator hosting the chip in the browser (an
+        // overlay's in-browser engine) is left to the attach extensions: the
+        // engine publishes its UART bytes on the overlay's own bus, and the
+        // shim's onSerialData is never invoked, so there is nothing here to
+        // listen on. Pure OSS never reaches this branch with kind esp32.
+        if (inst.hasUart && detectSimulatorKind(sim) !== 'esp32') {
           uartListener = (byte: number) => inst.feedUart(byte);
           bridges.uartListeners.add(uartListener);
           const route = inst.getUartTxRoute();
