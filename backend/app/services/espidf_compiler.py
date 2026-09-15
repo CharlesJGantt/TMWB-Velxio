@@ -83,6 +83,63 @@ def _write_if_changed(path: Path, text: str) -> bool:
 # Location of the ESP-IDF project template (relative to this file)
 _TEMPLATE_DIR = Path(__file__).parent / 'esp-idf-template'
 
+# Files this pipeline owns inside main/ in Arduino mode: the app_main() wrapper
+# that calls setup()/loop() (main.cpp), the pure-C twin the template ships,
+# the translated sketch, the compat header and the two configure inputs. A
+# user file with one of these names used to be written straight over them.
+# Measured 2026-09-15: a project carrying its own `main.cpp` (a helper, no
+# app_main) shadowed the wrapper, left a main.cpp.obj without the symbol in
+# the shared variant dir, and every Arduino build that landed there for the
+# next nine hours failed with "undefined reference to app_main" (573 builds,
+# 73 users). The user's file keeps compiling, under a name the template does
+# not use.
+_MAIN_RESERVED_NAMES = frozenset({
+    'main.cpp',
+    'main.c',
+    'sketch.ino.cpp',
+    'sketch_translated.c',
+    'velxio_compat.h',
+    'CMakeLists.txt',
+    'idf_component.yml',
+})
+_USER_FILE_PREFIX = 'user_'
+
+
+def _user_main_path(name: str) -> str:
+    """Path (relative to main/) a user file is written under in Arduino mode.
+
+    Reserved basenames get the `user_` prefix, everything else is untouched:
+    a helper called `main.cpp` becomes `user_main.cpp`, still globbed into
+    the main component, no longer sitting on the wrapper. The directory part
+    of the name, when there is one, is kept as it was.
+    """
+    posix = str(name or '').replace('\\', '/')
+    pure = PurePosixPath(posix)
+    if pure.name in _MAIN_RESERVED_NAMES:
+        return str(pure.with_name(_USER_FILE_PREFIX + pure.name))
+    return posix
+
+
+def _freshen_template_sources(main_dir: Path) -> None:
+    """Give the template's compilable sources under main/ an mtime of now.
+
+    copytree hands them the template's own mtime (months old), so ninja
+    compares a main.cpp "from June" against whatever main.cpp.obj the dir
+    holds and keeps the object whenever it is newer: an object compiled from
+    a user file that shadowed the wrapper, or one truncated by a restart,
+    then survives every later build of the variant. Only the sources are
+    touched: main/CMakeLists.txt is a configure input whose mtime the
+    stash/restore logic in _compile_in_dir manages on purpose, and the
+    header is picked up through the depfiles of the sources anyway. The
+    cost is one tiny TU per build, served by ccache in milliseconds.
+    """
+    for src in main_dir.glob('*'):
+        if src.is_file() and src.suffix in ('.c', '.cpp'):
+            try:
+                os.utime(src, None)
+            except OSError:
+                pass
+
 # ── Persistent build dir ─────────────────────────────────────────────────────
 # Cold ESP-IDF compiles rebuild ~1480 base objects (FreeRTOS, lwIP, esp_wifi,
 # libsodium, …). The default tempfile.TemporaryDirectory flow gave each compile
@@ -780,11 +837,14 @@ def _prepare_persistent_project_dir(
     if not project_dir.exists():
         variant_dir.mkdir(parents=True, exist_ok=True)
         shutil.copytree(_TEMPLATE_DIR, project_dir)
+        _freshen_template_sources(project_dir / 'main')
     else:
         # Reset per-compile parts only; keep build/ (warm for this variant).
         # copytree preserves the template's mtimes, so main/CMakeLists.txt
         # does NOT look new to ninja after this; the user's sources do, which
-        # is exactly what has to recompile.
+        # is exactly what has to recompile. The template's own sources get a
+        # fresh mtime right after (see _freshen_template_sources): an old one
+        # would let a stale main.cpp.obj outlive the file that produced it.
         # Both configure inputs under main/ are regenerated per build (the
         # CMakeLists patched for user_libs_all / IDF components, the managed
         # components manifest written from the sketch's includes). Keep the
@@ -799,6 +859,7 @@ def _prepare_persistent_project_dir(
         )
         shutil.rmtree(project_dir / 'main', ignore_errors=True)
         shutil.copytree(_TEMPLATE_DIR / 'main', project_dir / 'main')
+        _freshen_template_sources(project_dir / 'main')
         _stash_for_next_build(
             project_dir / 'user_libs' / 'user_libs_all' / 'CMakeLists.txt',
             project_dir / _USERLIBS_CMAKE_STASH,
@@ -5260,12 +5321,24 @@ class ESPIDFCompiler:
             main_content = generate_ino_prototypes(main_content)
             sketch_cpp.write_text(main_content, encoding='utf-8')
 
-            # Copy additional files (.h, .cpp)
+            # Copy additional files (.h, .cpp). A name the template owns
+            # (main.cpp above all) is written under a `user_` prefix instead
+            # of over the wrapper - see _MAIN_RESERVED_NAMES for the outage.
             for f in files:
-                if not f['name'].endswith('.ino'):
-                    (project_dir / 'main' / f['name']).write_text(
-                        f['content'], encoding='utf-8'
+                if f['name'].endswith('.ino'):
+                    continue
+                written = _user_main_path(f['name'])
+                if written != f['name']:
+                    note = (
+                        f"[velxio] {f['name']} is a name the build wrapper uses; "
+                        f'your file is compiled as {written}'
                     )
+                    logger.warning(f'[espidf] {note}')
+                    if progress_callback:
+                        progress_callback(note + '\n')
+                (project_dir / 'main' / written).write_text(
+                    f['content'], encoding='utf-8'
+                )
 
             # Remove the pure-C main to avoid conflict
             main_c = project_dir / 'main' / 'main.c'

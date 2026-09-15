@@ -236,3 +236,60 @@ class NicePreexecTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ReservedMainNamesTests(unittest.TestCase):
+    """A user file named like the template's main/ plumbing must not be written
+    over it (2026-09-15: a helper called main.cpp shadowed the app_main
+    wrapper and every later Arduino build of the variant failed to link)."""
+
+    def test_reserved_names_get_the_user_prefix(self):
+        for name in ('main.cpp', 'main.c', 'velxio_compat.h', 'CMakeLists.txt'):
+            self.assertEqual(ec._user_main_path(name), 'user_' + name)
+
+    def test_ordinary_helpers_are_untouched(self):
+        for name in ('helper.cpp', 'config.h', 'main_menu.cpp', 'Main.cpp'):
+            self.assertEqual(ec._user_main_path(name), name)
+
+    def test_the_directory_part_is_kept(self):
+        self.assertEqual(ec._user_main_path('src/main.cpp'), 'src/user_main.cpp')
+        self.assertEqual(ec._user_main_path('src\\main.c'), 'src/user_main.c')
+
+
+class TemplateSourceMtimeTests(unittest.TestCase):
+    """The restored wrapper must look NEW to ninja: a main.cpp with the
+    template's months-old mtime lets a stale main.cpp.obj (compiled from a
+    user file that shadowed it, or truncated by a restart) win forever."""
+
+    def _template(self, root: Path) -> Path:
+        tpl = root / 'template'
+        (tpl / 'main').mkdir(parents=True)
+        for name in ('main.cpp', 'main.c', 'CMakeLists.txt', 'velxio_compat.h'):
+            f = tpl / 'main' / name
+            f.write_text(f'// {name}\n')
+            old = time.time() - 90 * 86400
+            os.utime(f, (old, old))
+        (tpl / 'CMakeLists.txt').write_text('project\n')
+        return tpl
+
+    def test_reset_gives_the_wrapper_a_fresh_mtime_and_keeps_the_cmake_one(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(ec, '_BUILD_ROOT', Path(tmp) / 'build'), \
+                mock.patch.object(ec, '_TEMPLATE_DIR', self._template(Path(tmp))), \
+                mock.patch.object(ec, '_idf_version_signature', lambda: 'sig'):
+            project = ec._prepare_persistent_project_dir('esp32', 'abc')
+            # A stale object from an earlier build, newer than the template file.
+            stale = time.time() - 3600
+            obj = project / 'build' / 'main.cpp.obj'
+            obj.parent.mkdir(parents=True)
+            obj.write_bytes(b'\0')
+            os.utime(obj, (stale, stale))
+            # The next build resets main/ from the template.
+            project = ec._prepare_persistent_project_dir('esp32', 'abc')
+            wrapper = project / 'main' / 'main.cpp'
+            self.assertGreater(wrapper.stat().st_mtime, obj.stat().st_mtime)
+            self.assertGreater((project / 'main' / 'main.c').stat().st_mtime, stale)
+            # Configure inputs keep the template's mtime: their freshness is
+            # the stash/restore logic's business, not this one's.
+            self.assertLess((project / 'main' / 'CMakeLists.txt').stat().st_mtime, stale)
+            self.assertLess((project / 'main' / 'velxio_compat.h').stat().st_mtime, stale)
