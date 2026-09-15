@@ -91,9 +91,9 @@ _TEMPLATE_DIR = Path(__file__).parent / 'esp-idf-template'
 # app_main) shadowed the wrapper, left a main.cpp.obj without the symbol in
 # the shared variant dir, and every Arduino build that landed there for the
 # next nine hours failed with "undefined reference to app_main" (573 builds,
-# 73 users). The user's file keeps compiling, under a name the template does
-# not use.
-_MAIN_RESERVED_NAMES = frozenset({
+# 73 users). Compared case-insensitively: on a Windows or macOS host
+# Main.cpp and main.cpp are the same file.
+_MAIN_RESERVED_NAMES = frozenset(n.casefold() for n in (
     'main.cpp',
     'main.c',
     'sketch.ino.cpp',
@@ -101,44 +101,194 @@ _MAIN_RESERVED_NAMES = frozenset({
     'velxio_compat.h',
     'CMakeLists.txt',
     'idf_component.yml',
-})
+))
 _USER_FILE_PREFIX = 'user_'
+# What the template's main/CMakeLists.txt globs into the main component.
+_COMPILED_SUFFIXES = ('.c', '.cpp')
 
 
-def _user_main_path(name: str) -> str:
-    """Path (relative to main/) a user file is written under in Arduino mode.
+def _user_main_name(name: str) -> str | None:
+    """File name inside main/ that a user file is written under in Arduino
+    mode, or None when the name is unusable.
 
-    Reserved basenames get the `user_` prefix, everything else is untouched:
-    a helper called `main.cpp` becomes `user_main.cpp`, still globbed into
-    the main component, no longer sitting on the wrapper. The directory part
-    of the name, when there is one, is kept as it was.
+    Only the last path component is kept, the way the pure ESP-IDF branch
+    already does it. main/ is flat: the template CMake globs its top level
+    only (a source in a sub-directory never compiled) and the write never
+    created the parent (it crashed instead). And a name with '..' or an
+    absolute path must never leave main/: the process runs as root in a build
+    dir other users share. A basename the template owns gets the `user_`
+    prefix, so the user's code still compiles and the wrapper stays.
     """
-    posix = str(name or '').replace('\\', '/')
-    pure = PurePosixPath(posix)
-    if pure.name in _MAIN_RESERVED_NAMES:
-        return str(pure.with_name(_USER_FILE_PREFIX + pure.name))
-    return posix
+    base = PurePosixPath(str(name or '').replace('\\', '/')).name
+    if base in ('', '.', '..'):
+        return None
+    if base.casefold() in _MAIN_RESERVED_NAMES:
+        return _USER_FILE_PREFIX + base
+    return base
 
 
-def _freshen_template_sources(main_dir: Path) -> None:
-    """Give the template's compilable sources under main/ an mtime of now.
+def _defines_app_main(code: str) -> bool:
+    """True when real code (not a comment or a string) defines app_main()."""
+    return bool(re.search(r'\bvoid\s+app_main\s*\(', _blank_noncode(code)))
 
-    copytree hands them the template's own mtime (months old), so ninja
-    compares a main.cpp "from June" against whatever main.cpp.obj the dir
-    holds and keeps the object whenever it is newer: an object compiled from
-    a user file that shadowed the wrapper, or one truncated by a restart,
-    then survives every later build of the variant. Only the sources are
-    touched: main/CMakeLists.txt is a configure input whose mtime the
-    stash/restore logic in _compile_in_dir manages on purpose, and the
-    header is picked up through the depfiles of the sources anyway. The
-    cost is one tiny TU per build, served by ccache in milliseconds.
+
+def _missing_app_main(output: str) -> bool:
+    """The link failed because nothing defined app_main()."""
+    return "undefined reference to `app_main'" in output
+
+
+def _write_arduino_user_files(
+    main_dir: Path,
+    files: list[dict],
+    entry_file: dict | None,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> str | None:
+    """Write the non-.ino files of an Arduino-mode build into main/.
+
+    Returns an error message for the user, or None.
+
+    - `entry_file` is the file compile() used as the sketch because there is
+      no .ino (files[0]). It already reaches the build as sketch.ino.cpp, so a
+      .c/.cpp entry is not written again (it used to compile twice, once as
+      C). A header entry is still written: other files include it.
+    - Names go through _user_main_name: flattened, kept inside main/, and a
+      name the template owns renamed to `user_<name>`.
+    - Two files that would land on the same name are an error, not a silent
+      overwrite.
+    - A user source that defines its own app_main() replaces the template
+      wrapper for this build. That is a custom entry point, and it used to
+      work by overwriting main.cpp, so it has to keep working. The wrapper is
+      deleted rather than shadowed; it comes back from the template on the
+      next build and _advance_changed_inputs gives it a new mtime, so no
+      object from this build can outlive it.
     """
-    for src in main_dir.glob('*'):
-        if src.is_file() and src.suffix in ('.c', '.cpp'):
+    def note(text: str) -> None:
+        logger.warning(f'[espidf] {text}')
+        if progress_callback is not None:
             try:
-                os.utime(src, None)
-            except OSError:
+                progress_callback(f'[velxio] {text}\n')
+            except Exception:
                 pass
+
+    written: dict[str, str] = {}
+    custom_entry: str | None = None
+    for f in files:
+        name = str(f.get('name') or '')
+        if name.endswith('.ino'):
+            continue
+        if f is entry_file and name.endswith(_COMPILED_SUFFIXES):
+            continue
+        target = _user_main_name(name)
+        if target is None:
+            note(f'skipped a file with an unusable name: {name!r}')
+            continue
+        if target in written:
+            return (
+                f'"{name}" and "{written[target]}" would both be compiled as '
+                f'{target}. Rename one of them.'
+            )
+        written[target] = name
+        if target != PurePosixPath(name.replace('\\', '/')).name:
+            note(
+                f'{name} is a name the build wrapper uses; your file is '
+                f'compiled as {target}'
+            )
+        content = f.get('content', '')
+        (main_dir / target).write_text(content, encoding='utf-8')
+        if (
+            custom_entry is None
+            and target.endswith(_COMPILED_SUFFIXES)
+            and _defines_app_main(content)
+        ):
+            custom_entry = target
+    if custom_entry is not None:
+        (main_dir / 'main.cpp').unlink(missing_ok=True)
+        note(
+            f'{custom_entry} defines app_main(); it replaces the Arduino '
+            'setup()/loop() wrapper'
+        )
+    return None
+
+
+# Per variant: what each tracked input held, and the mtime it was left with.
+_INPUT_DIGESTS = '.velxio-input-digests.json'
+# The per-build inputs this pipeline recreates (the rest of the project dir is
+# either generated through _write_if_changed or owned by cmake/ninja).
+_TRACKED_INPUT_DIRS = ('main', 'user_libs')
+
+
+def _advance_changed_inputs(project_dir: Path) -> int:
+    """Keep ninja's mtime test honest for every file this pipeline recreates.
+
+    ninja rebuilds an object only when one of its inputs is NEWER than it.
+    Everything under main/ and user_libs/ is recreated on every build, and
+    copytree / copy2 hand each file the mtime of its SOURCE: the template's
+    (months old) or the library cache's. A path whose content changes while
+    its mtime stays in the past therefore keeps the object built from the old
+    content, forever, in a build dir other users share. That is the 2026-09-15
+    outage (a user main.cpp left a main.cpp.obj without app_main, the wrapper
+    came back with its June mtime, and ninja never looked at it again), and a
+    library version bump in the scan-all view has the same shape.
+
+    The invariant: for a given path the mtime never goes backwards, and it
+    moves forward whenever the content changes.
+      - content differs from the last build, or the path is new: mtime = now
+      - same content, but the copy moved the mtime into the past: the mtime it
+        had after the last build is restored, so nothing rebuilds needlessly
+      - same content, same or newer mtime: left alone (a warm build stays warm)
+    A dir with no record yet treats every file as changed. That costs one
+    rebuild of the main component and the user libraries (ccache hits), and it
+    repairs a dir poisoned before this existed.
+
+    Returns the number of files whose mtime was moved.
+    """
+    record_path = project_dir / _INPUT_DIGESTS
+    try:
+        previous = json.loads(record_path.read_text(encoding='utf-8'))
+        if not isinstance(previous, dict):
+            previous = {}
+    except (OSError, ValueError):
+        previous = {}
+    now_ns = time.time_ns()
+    current: dict[str, list] = {}
+    moved = 0
+    for root_name in _TRACKED_INPUT_DIRS:
+        root = project_dir / root_name
+        if not root.is_dir():
+            continue
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for fname in filenames:
+                path = Path(dirpath) / fname
+                if path.is_symlink() or not path.is_file():
+                    continue
+                rel = path.relative_to(project_dir).as_posix()
+                try:
+                    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                    mtime_ns = path.stat().st_mtime_ns
+                except OSError:
+                    continue
+                prev = previous.get(rel)
+                target_ns = None
+                if not (isinstance(prev, list) and len(prev) == 2 and prev[0] == digest):
+                    target_ns = now_ns
+                elif isinstance(prev[1], int) and mtime_ns < prev[1]:
+                    target_ns = prev[1]
+                if target_ns is not None:
+                    try:
+                        os.utime(path, ns=(target_ns, target_ns))
+                        mtime_ns = target_ns
+                        moved += 1
+                    except OSError:
+                        pass
+                current[rel] = [digest, mtime_ns]
+    try:
+        tmp = project_dir / (_INPUT_DIGESTS + '.tmp')
+        tmp.write_text(json.dumps(current), encoding='utf-8')
+        os.replace(tmp, record_path)
+    except OSError:
+        pass
+    return moved
+
 
 # ── Persistent build dir ─────────────────────────────────────────────────────
 # Cold ESP-IDF compiles rebuild ~1480 base objects (FreeRTOS, lwIP, esp_wifi,
@@ -837,14 +987,23 @@ def _prepare_persistent_project_dir(
     if not project_dir.exists():
         variant_dir.mkdir(parents=True, exist_ok=True)
         shutil.copytree(_TEMPLATE_DIR, project_dir)
-        _freshen_template_sources(project_dir / 'main')
     else:
         # Reset per-compile parts only; keep build/ (warm for this variant).
         # copytree preserves the template's mtimes, so main/CMakeLists.txt
-        # does NOT look new to ninja after this; the user's sources do, which
-        # is exactly what has to recompile. The template's own sources get a
-        # fresh mtime right after (see _freshen_template_sources): an old one
-        # would let a stale main.cpp.obj outlive the file that produced it.
+        # does NOT look new to ninja after this. That is also true of the
+        # template's main.cpp, which is why _compile_in_dir runs
+        # _advance_changed_inputs before ninja: an mtime copied from the
+        # template must never let an object built from other content survive.
+        # The top-level CMakeLists.txt came from the template when the variant
+        # was created; bring a changed template to warm variants too (the
+        # mtime moves only when the bytes differ, and ninja reconfigures).
+        try:
+            _write_if_changed(
+                project_dir / 'CMakeLists.txt',
+                (_TEMPLATE_DIR / 'CMakeLists.txt').read_text(encoding='utf-8'),
+            )
+        except OSError:
+            pass
         # Both configure inputs under main/ are regenerated per build (the
         # CMakeLists patched for user_libs_all / IDF components, the managed
         # components manifest written from the sketch's includes). Keep the
@@ -859,7 +1018,6 @@ def _prepare_persistent_project_dir(
         )
         shutil.rmtree(project_dir / 'main', ignore_errors=True)
         shutil.copytree(_TEMPLATE_DIR / 'main', project_dir / 'main')
-        _freshen_template_sources(project_dir / 'main')
         _stash_for_next_build(
             project_dir / 'user_libs' / 'user_libs_all' / 'CMakeLists.txt',
             project_dir / _USERLIBS_CMAKE_STASH,
@@ -2262,10 +2420,16 @@ class ESPIDFCompiler:
             'cmake configure failed',
             'sdkconfig.h: no such file',
             'ninja: error',
-            'esp-idf/bootloader',
             'cmake error',
         )
-        return any(m in text for m in markers)
+        if any(m in text for m in markers):
+            return True
+        # The nested bootloader sub-build failing, matched on ninja's FAILED
+        # line. A bare 'esp-idf/bootloader' substring is also part of every
+        # app link command (libbootloader_support.a), so it classified every
+        # link error as transient and built it twice (587 retries on
+        # 2026-09-15, none of which could help).
+        return bool(re.search(r'^\s*failed:[^\n]*bootloader', text, re.M))
 
     def _suggest_libraries_for_headers(self, headers: list[str]) -> dict:
         """For each missing header, the installed libraries that provide it
@@ -4498,6 +4662,12 @@ class ESPIDFCompiler:
             # the name. Strip any leading slash to avoid escaping the dir.
             safe_path = name.lstrip('/').lstrip('\\')
             dest = spiffs_data_dir / safe_path
+            # The name comes from the client: '..' must not leave spiffs_data/
+            # (the build dir next to it is shared, and the process is root).
+            data_root = spiffs_data_dir.resolve()
+            resolved = dest.resolve()
+            if resolved == data_root or not resolved.is_relative_to(data_root):
+                raise ValueError(f'Invalid SPIFFS file name: {name!r}')
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(data)
 
@@ -5214,8 +5384,12 @@ class ESPIDFCompiler:
                 f'#line 1 "{f["name"]}"\n{f["content"]}'
                 for f in [main_ino] + rest
             )
+        # The file compiled as the sketch when there is no .ino: its content
+        # already becomes sketch.ino.cpp (see _write_arduino_user_files).
+        entry_file = None
         if not main_content and files:
             main_content = files[0]['content']
+            entry_file = files[0]
 
         # ── QEMU WiFi compatibility ──────────────────────────────────────
         # QEMU's WiFi AP broadcasts "Velxio-GUEST" on channel 6.
@@ -5321,24 +5495,19 @@ class ESPIDFCompiler:
             main_content = generate_ino_prototypes(main_content)
             sketch_cpp.write_text(main_content, encoding='utf-8')
 
-            # Copy additional files (.h, .cpp). A name the template owns
-            # (main.cpp above all) is written under a `user_` prefix instead
-            # of over the wrapper - see _MAIN_RESERVED_NAMES for the outage.
-            for f in files:
-                if f['name'].endswith('.ino'):
-                    continue
-                written = _user_main_path(f['name'])
-                if written != f['name']:
-                    note = (
-                        f"[velxio] {f['name']} is a name the build wrapper uses; "
-                        f'your file is compiled as {written}'
-                    )
-                    logger.warning(f'[espidf] {note}')
-                    if progress_callback:
-                        progress_callback(note + '\n')
-                (project_dir / 'main' / written).write_text(
-                    f['content'], encoding='utf-8'
-                )
+            # Copy additional files (.h, .cpp): flattened into main/, a name the
+            # template owns renamed, a custom app_main() replacing the wrapper.
+            # See _write_arduino_user_files for the 2026-09-15 outage.
+            files_error = _write_arduino_user_files(
+                project_dir / 'main', files, entry_file, progress_callback,
+            )
+            if files_error is not None:
+                return {
+                    'success': False,
+                    'error': files_error,
+                    'stdout': '',
+                    'stderr': '',
+                }
 
             # Remove the pure-C main to avoid conflict
             main_c = project_dir / 'main' / 'main.c'
@@ -5569,6 +5738,16 @@ class ESPIDFCompiler:
                     pass
                 logger.info('[espidf] source set changed; cmake will re-glob main/')
 
+        # Last step before cmake/ninja see the tree: every recreated input
+        # whose content changed gets an mtime ninja cannot ignore, and a copy
+        # that moved an unchanged file into the past gets its old mtime back.
+        try:
+            moved = await asyncio.to_thread(_advance_changed_inputs, project_dir)
+            if moved:
+                logger.info(f'[espidf] {moved} changed input(s) given a new mtime')
+        except Exception:
+            logger.exception(f'[espidf] could not check input digests in {project_dir}')
+
         # A warm build dir skips the explicit configure: ninja re-runs cmake by
         # itself when any configure input changed (partitions.csv,
         # velxio_board.cmake, sdkconfig, every CMakeLists.txt, the managed
@@ -5777,6 +5956,27 @@ class ESPIDFCompiler:
                 if configure_error is not None:
                     return configure_error
                 ninja_result = await asyncio.to_thread(_run_ninja)
+            if (
+                ninja_result.returncode != 0
+                and arduino_mode
+                and (project_dir / 'main' / 'main.cpp').is_file()
+                and _missing_app_main(ninja_result.stdout + '\n' + ninja_result.stderr)
+            ):
+                # The template wrapper is in main/ and still nothing defined
+                # app_main: an object in this shared dir was built from other
+                # content (the 2026-09-15 outage). _advance_changed_inputs
+                # should make that impossible; if it ever happens anyway, drop
+                # the main component's objects and link again, once, instead of
+                # failing every build of the variant until someone deletes them.
+                logger.error(
+                    f'[espidf] wrapper-missing link in {project_dir}; '
+                    'rebuilding the main component'
+                )
+                _timing_note(app_main_heal=True)
+                main_build = build_dir / 'esp-idf' / 'main'
+                shutil.rmtree(main_build / 'CMakeFiles' / '__idf_main.dir', ignore_errors=True)
+                (main_build / 'libmain.a').unlink(missing_ok=True)
+                ninja_result = await asyncio.to_thread(_run_ninja)
         except subprocess.TimeoutExpired:
             # Silent before — a 600s failure left no server-side trace at all,
             # so a slow-box incident (2026-08-17: cold S3 variant, ccache
@@ -5861,7 +6061,14 @@ class ESPIDFCompiler:
             # Put extracted errors in stderr so the console highlights them
             combined_stderr = (extracted + '\n\n' + all_stderr).strip() if extracted else all_stderr
 
-            logger.error(f'[espidf] ninja build failed (stdout):\n{ninja_result.stdout[-4000:]}')
+            logger.error(
+                # Dir and mode on the header: a missing app_main in a pure
+                # ESP-IDF build is the user's own error, in Arduino mode it
+                # means a poisoned dir (scripts watching the log tell them apart).
+                f'[espidf] ninja build failed in {project_dir} '
+                f'mode={"arduino" if arduino_mode else "pure-idf"} (stdout):\n'
+                f'{ninja_result.stdout[-4000:]}'
+            )
             logger.error(f'[espidf] ninja build failed (stderr):\n{ninja_result.stderr[-2000:]}')
             return {
                 'success': False,
