@@ -142,8 +142,20 @@ registerLineModel('matrix-keypad', (rec: LineSensorRecord) => {
   const wires = [...new Set([...rows, ...cols].filter((p) => p >= 0))];
   let held = heldKeys(rec.pressed);
   const pads = new Map<number, WirePad>();
-  /** What was last put on each wire ("<level>|<released>"), so nothing costs a repeat edge. */
-  const applied = new Map<number, string>();
+  /**
+   * What each wire was last put at ("<level>|<released>"), so nothing costs a
+   * repeat edge. Seeded with what `rest()` applies at attach — released, on the
+   * pull-up — because the alternative is a storm: with the map empty, the first
+   * pad event of a run makes all eight wires look changed and emits eight
+   * no-op frames at one cycle. The engines' edge heaps are not stable for equal
+   * cycles, so the real decision that follows in the same cycle could be
+   * applied BEFORE one of those no-ops and be overwritten by it. That is
+   * exactly what made the first pass of a scan miss the key on all six
+   * in-browser ESP32 engines while the second pass saw it.
+   */
+  const applied = new Map<number, string>(wires.map((pin) => [pin, `${true}|${true}`]));
+  /** Last cycle an edge was placed on each wire — see `at` below. */
+  const lastAt = new Map<number, number>();
 
   const padOf = (pin: number): Readonly<WirePad> => pads.get(pin) ?? RELEASED;
 
@@ -156,10 +168,22 @@ registerLineModel('matrix-keypad', (rec: LineSensorRecord) => {
       const key = `${level}|${free}`;
       if (applied.get(pin) === key) continue;
       applied.set(pin, key);
+      // Strictly after anything already placed on THIS wire. Two guest events
+      // can land in the same cycle (a pinMode and the digitalWrite after it,
+      // on an engine whose clock does not move between two register writes),
+      // and the second decision has to win. A host that keeps its edges in
+      // insertion order gets the same answer; one that keeps a heap keyed on
+      // the cycle would otherwise be free to apply them the wrong way round.
+      const last = lastAt.get(pin);
+      const at = last === undefined ? now : Math.max(now, last + 1);
+      lastAt.set(pin, free ? at + 1 : at);
       frames.push(
+        // The release is one cycle AFTER the level, for the same reason: a
+        // release applied before its own inject would leave the pad held by
+        // the host at that level on every engine that models pad ownership.
         free
-          ? { pin, edges: [{ level, atCycle: now }], releaseAtCycle: now }
-          : { pin, edges: [{ level, atCycle: now }] },
+          ? { pin, edges: [{ level, atCycle: at }], releaseAtCycle: at + 1 }
+          : { pin, edges: [{ level, atCycle: at }] },
       );
     }
     return frames;
@@ -184,7 +208,11 @@ registerLineModel('matrix-keypad', (rec: LineSensorRecord) => {
     },
     reset() {
       pads.clear();
+      lastAt.clear();
+      // Back to what rest() is about to re-apply, not to "unknown": the same
+      // reason the map is seeded at construction.
       applied.clear();
+      for (const pin of wires) applied.set(pin, `${true}|${true}`);
     },
   };
   return model;

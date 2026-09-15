@@ -10,6 +10,8 @@ import { RP2040 } from 'rp2040js';
 import { AVRSimulator } from '../../AVRSimulator';
 import { RP2040Simulator } from '../../RP2040Simulator';
 import { PinManager } from '../../PinManager';
+import { createLineModel, framesOf } from '../lineModels';
+import { INITIAL_PAD, type PadEvent } from '../padEvent';
 import { solveKeypad, type WirePad } from '../models/matrix-keypad';
 import { requestLine, type LineLease } from '../requestLine';
 import '../index';
@@ -70,6 +72,84 @@ describe('matrix keypad: the circuit', () => {
     const out = solveKeypad(ROWS, COLS, held, padsOf({ [COLS[1]]: pad('low') }));
     expect(out.get(ROWS[0])).toBe('low');
     expect(out.get(ROWS[1])).toBe('low'); // C1 -> R0 -> C0 -> R1
+  });
+
+  it('the first event of a run puts nothing on a wire that is already at rest', () => {
+    // Eight no-op frames at one cycle is not a tidiness problem: the engines'
+    // edge heaps are not stable for equal cycles, so a real decision taken in
+    // the same cycle could be applied before one of the no-ops and then
+    // overwritten by it. That is what made the first pass of a scan miss the
+    // key on all six in-browser ESP32 engines while the second pass saw it.
+    const m = createLineModel({
+      sensor_type: 'matrix-keypad',
+      pin: ROWS[0],
+      rows: ROWS,
+      cols: COLS,
+      pressed: [],
+    })!;
+    const clock = { now: () => 1000, us: (n: number) => n * 16 };
+    const pullUp: PadEvent = {
+      pin: ROWS[0],
+      drive: 'z',
+      pull: 1,
+      level: true,
+      cycle: 1000,
+      prev: INITIAL_PAD,
+    };
+    expect(framesOf(m.onPad(pullUp, clock))).toEqual([]);
+
+    // And the decision that follows is one frame, on one wire, alone.
+    const driveLow: PadEvent = {
+      pin: COLS[0],
+      drive: 'low',
+      pull: 0,
+      level: false,
+      cycle: 1000,
+      prev: INITIAL_PAD,
+    };
+    m.update({ pressed: [[0, 0]] }, clock);
+    const frames = framesOf(m.onPad(driveLow, clock));
+    expect(frames.map((f) => f.pin)).toEqual([ROWS[0], COLS[0]]);
+    expect(frames[0].edges).toEqual([{ level: false, atCycle: 1000 }]);
+  });
+
+  it('two decisions on one wire in the same cycle are ordered, and a release follows its level', () => {
+    // A pinMode and the digitalWrite after it can land in the same cycle on an
+    // engine whose clock does not move between two register writes. The second
+    // decision has to win, and a release must never be applied before the
+    // level it releases.
+    const m = createLineModel({
+      sensor_type: 'matrix-keypad',
+      pin: ROWS[0],
+      rows: ROWS,
+      cols: COLS,
+      pressed: [[0, 0]],
+    })!;
+    const clock = { now: () => 500, us: (n: number) => n * 16 };
+    const low = framesOf(
+      m.onPad(
+        { pin: COLS[0], drive: 'low', pull: 0, level: false, cycle: 500, prev: INITIAL_PAD },
+        clock,
+      ),
+    );
+    const rowFrame = low.find((f) => f.pin === ROWS[0])!;
+    expect(rowFrame.edges[0].atCycle).toBe(500);
+    const released = framesOf(
+      m.onPad(
+        {
+          pin: COLS[0],
+          drive: 'z',
+          pull: 1,
+          level: true,
+          cycle: 500,
+          prev: { drive: 'low', pull: 0, level: false, cycle: 500 },
+        },
+        clock,
+      ),
+    );
+    const rowAfter = released.find((f) => f.pin === ROWS[0])!;
+    expect(rowAfter.edges[0].atCycle).toBeGreaterThan(rowFrame.edges[0].atCycle);
+    expect(rowAfter.releaseAtCycle).toBeGreaterThan(rowAfter.edges[0].atCycle);
   });
 
   it('an unwired row or column is skipped, never treated as pin -1', () => {

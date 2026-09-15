@@ -137,6 +137,31 @@ def test_release_returns_to_the_pull():
     assert g.read(ROWS[1]) == 0
 
 
+def test_a_released_wire_is_always_re_asserted():
+    # A host whose stored input value is clobbered by the guest's own output
+    # latch while the wire is an output: the F1 STM32 map returns the raw IDR,
+    # which the guest's ODR write goes into. When the firmware releases the
+    # wire, the model must re-assert the level rather than trust its memo.
+    kp = MatrixKeypad(ROWS, COLS)
+    g = Guest(kp)
+    g.hold((0, 0))
+    g.output(COLS[0])
+    g.write(COLS[0], 0)
+    assert g.read(ROWS[0]) == 0
+    g.input(COLS[0])
+    assert g.read(ROWS[0]) == 1
+    # The guest drives the ROW itself, high, and lets go again. Nothing about
+    # the matrix changed, so a memo-only model would stay silent and leave the
+    # wire reading the guest's old HIGH.
+    g.output(ROWS[0])
+    g.write(ROWS[0], 1)
+    g.inputs[ROWS[0]] = 1  # the host's stored value, clobbered by the latch
+    g.output(COLS[0])
+    g.write(COLS[0], 0)
+    g.input(ROWS[0])
+    assert g.read(ROWS[0]) == 0
+
+
 def test_unwired_lines_are_ignored():
     kp = MatrixKeypad([13, -1, 14, 27], [26, 25, 33, -1])
     g = Guest(kp)

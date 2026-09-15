@@ -93,7 +93,18 @@ class MatrixKeypad:
     def on_enable(self, gpio: int, enabled: int) -> list[tuple[int, int]]:
         if gpio not in self._applied:
             return []
+        was = self._enable.get(gpio, 0)
         self._enable[gpio] = 1 if enabled else 0
+        if was and not enabled:
+            # The firmware just let go of this wire. Forget what WE last set on
+            # it: while it was an output, the host's stored input value was not
+            # what the guest read, and on some of them it was overwritten by
+            # the guest's own output latch (the F1 STM32 map returns the raw
+            # IDR, which stm32_gpio_update_outputs writes while the pin drives).
+            # Without this, a wire released back to a level the model already
+            # believes it set would never be re-asserted, and the guest would
+            # read whatever it last drove instead of the matrix.
+            self._applied[gpio] = None
         return self._settle()
 
     # ── canvas events ──────────────────────────────────────────────────────
