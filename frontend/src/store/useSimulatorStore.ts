@@ -1886,6 +1886,12 @@ export const useSimulatorStore = create<SimulatorState>((set, get) => {
             boards: s.boards.map((b) => (b.id === id ? { ...b, busRelay: true } : b)),
           }));
         };
+        // The host took a line sensor it has no model for and said so. The
+        // refusal lands on the component that asked and the circuit check
+        // prints it at Run, exactly like one the browser made itself.
+        bridge.onSystemEvent = (event, data) => {
+          if (event === 'sensor_refused') shim.noteSensorRefused(data);
+        };
         const disconnected = bridge.onDisconnected;
         bridge.onDisconnected = () => {
           shim.stopBusSync();
