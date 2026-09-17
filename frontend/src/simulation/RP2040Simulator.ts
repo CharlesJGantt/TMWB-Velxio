@@ -7,7 +7,7 @@ import { bootromB1 } from './rp2040-bootrom';
 import { loadUF2, loadUserFiles, getFirmware } from './MicroPythonLoader';
 import { type PioPeripheral, createPioPeripheral } from './PioPeripheral';
 import { requestElectricalResolve } from './spice/electricalResolveHook';
-import { USB_CDC_LINK, watchRpUartLine } from './rpUartLine';
+import { RP2040_CLOCKS_KEY, USB_CDC_LINK, watchRpPeriClock, watchRpUartLine } from './rpUartLine';
 import type { SerialLink } from '../store/serialWire';
 import type { LineCapable, LineHostPort, LineSupport } from './line/LineHost';
 import { LineSensorHub } from './line/LineSensorHub';
@@ -773,7 +773,16 @@ export class RP2040Simulator implements LineCapable {
     // ── Wire UART0 (default Serial port for Arduino-Pico) ────────────
     // The line it clocks goes to the monitor: Serial.begin(9600) on the Pico is
     // a real PL011 divisor, and a terminal at 115200 really decodes garbage.
-    watchRpUartLine(this.rp2040.uart[0], (link) => this.onBaudRateChange?.(link.baud, link));
+    const line = watchRpUartLine(this.rp2040.uart[0], (link) =>
+      this.onBaudRateChange?.(link.baud, link),
+    );
+    // arduino-pico parks clk_peri on the 48 MHz USB PLL at boot (set_sys_clock_khz);
+    // the engine must follow, or every rate reads 125/48 too fast.
+    watchRpPeriClock(
+      this.rp2040 as unknown as Parameters<typeof watchRpPeriClock>[0],
+      RP2040_CLOCKS_KEY,
+      () => line.publish(),
+    );
     let serialBuffer = '';
     this.rp2040.uart[0].onByte = (value: number) => {
       const ch = String.fromCharCode(value);

@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { RP2040 } from 'rp2040js';
-import { rpUartLink, watchRpUartLine } from '../simulation/rpUartLine';
+import {
+  RP2040_CLOCKS_KEY,
+  rpUartLink,
+  watchRpPeriClock,
+  watchRpUartLine,
+} from '../simulation/rpUartLine';
 import type { SerialLink } from '../store/serialWire';
 
 /**
@@ -15,8 +20,13 @@ const UARTCR = 0x30;
 const CLK_PERI = 125_000_000;
 
 /** pico-sdk uart_set_baudrate + uart_set_format(8N1), byte for byte. */
-function guestInit(uart: RP2040['uart'][0], baud: number, lcr = 0x70 /* WLEN=8, FEN */): void {
-  const div = Math.floor((8 * CLK_PERI) / baud);
+function guestInit(
+  uart: RP2040['uart'][0],
+  baud: number,
+  lcr = 0x70 /* WLEN=8, FEN */,
+  clkPeri = CLK_PERI,
+): void {
+  const div = Math.floor((8 * clkPeri) / baud);
   let ibrd = div >>> 7;
   let fbrd: number;
   if (ibrd === 0) {
@@ -70,5 +80,33 @@ describe('the line a Pico UART clocks', () => {
 
   it('has no rate to report before the divisor is programmed', () => {
     expect(rpUartLink(new RP2040().uart[0])).toBeNull();
+  });
+
+  it('follows the guest onto the 48 MHz USB PLL, as arduino-pico leaves clk_peri', () => {
+    // set_sys_clock_pll parks clk_peri on pll_usb (CLK_PERI_CTRL AUXSRC = 2) and the
+    // sketch then computes its divisor for 48 MHz. Read through a fixed 125 MHz that
+    // came out as 299,940 baud for a Serial.begin(115200).
+    const mcu = new RP2040();
+    const seen: SerialLink[] = [];
+    const line = watchRpUartLine(mcu.uart[0], (l) => seen.push(l));
+    watchRpPeriClock(mcu, RP2040_CLOCKS_KEY, () => line.publish());
+    mcu.writeUint32(0x40008000 + 0x48, (2 << 5) | (1 << 11)); // AUXSRC = pll_usb, ENABLE
+    guestInit(mcu.uart[0], 115200, 0x70, 48_000_000);
+    const last = seen[seen.length - 1];
+    expect(Math.abs(last.baud - 115200) / 115200).toBeLessThan(0.005);
+    expect(mcu.clkPeri).toBe(48_000_000);
+  });
+
+  it('re-reports the line when clk_peri moves under a programmed divisor', () => {
+    const mcu = new RP2040();
+    const seen: SerialLink[] = [];
+    const line = watchRpUartLine(mcu.uart[0], (l) => seen.push(l));
+    watchRpPeriClock(mcu, RP2040_CLOCKS_KEY, () => line.publish());
+    guestInit(mcu.uart[0], 9600); // divisor for the 125 MHz clk_sys default
+    const n = seen.length;
+    mcu.writeUint32(0x40008000 + 0x48, (4 << 5) | (1 << 11)); // AUXSRC = xosc 12 MHz
+    expect(seen.length).toBe(n + 1);
+    const expected = (9600 * 12) / 125;
+    expect(Math.abs(seen[n].baud - expected) / expected).toBeLessThan(0.01);
   });
 });

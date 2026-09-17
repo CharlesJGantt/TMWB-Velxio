@@ -55,7 +55,10 @@ export function rpUartLink(uart: RpUartLike): SerialLink | null {
  * `onBaudRateChange` slot and wraps `writeUint32` for the format/enable registers;
  * the engine dispatches MMIO through the instance, so the wrapper is what it calls.
  */
-export function watchRpUartLine(uart: RpUartLike, onLink: (link: SerialLink) => void): void {
+export function watchRpUartLine(
+  uart: RpUartLike,
+  onLink: (link: SerialLink) => void,
+): { publish: () => void } {
   let last: SerialLink | null = null;
   const publish = (): void => {
     const link = rpUartLink(uart);
@@ -77,5 +80,82 @@ export function watchRpUartLine(uart: RpUartLike, onLink: (link: SerialLink) => 
   uart.writeUint32 = (offset: number, value: number): void => {
     write(offset, value);
     if (offset === UARTLCR_H || offset === UARTCR) publish();
+  };
+  return { publish };
+}
+
+/** The slice of rp2040js / rp2350js `RP2040` / `RP2350` the peripheral clock needs. */
+export interface RpMcuLike {
+  clkSys: number;
+  clkPeri: number;
+  peripherals: Record<number, { writeUint32(offset: number, value: number): void } | undefined>;
+}
+
+/** CLOCKS.CLK_PERI_CTRL / _DIV offsets (same on both chips: generator 6, stride 0xc). */
+const CLK_PERI_CTRL = 0x48;
+const CLK_PERI_DIV = 0x4c;
+/** rp2040js keys its peripheral map by address >> 14 << 2; CLOCKS_BASE differs per chip. */
+export const RP2040_CLOCKS_KEY = 0x40008;
+export const RP2350_CLOCKS_KEY = 0x40010;
+const PLL_USB_HZ = 48_000_000;
+const XOSC_HZ = 12_000_000;
+const ROSC_HZ = 6_500_000;
+
+/**
+ * Keep the engine's `clkPeri` at what the guest selected in CLK_PERI_CTRL.
+ *
+ * Both engines hold `clkPeri` at a fixed 125 MHz and never look at the CLOCKS
+ * block, but the guest does: arduino-pico's main() calls set_sys_clock_khz(), and
+ * pico-sdk's set_sys_clock_pll parks clk_peri on the 48 MHz USB PLL and leaves it
+ * there (PICO_CLOCK_ADJUST_PERI_CLOCK_WITH_SYS_CLOCK defaults to 0). The UART divisor
+ * the sketch then programs is right for 48 MHz — Serial.begin(115200) read back as
+ * 299,940 baud through a 125 MHz clkPeri, 125/48 too fast, and a monitor set to
+ * 115200 would have been called a mismatch against a board that was in fact right.
+ *
+ * AUXSRC [7:5] (RP2040 / RP2350 datasheets, CLK_PERI_CTRL): 0 = clk_sys, 1 = pll_sys
+ * (clk_sys's own PLL — the engine's clkSys is the honest stand-in), 2 = pll_usb,
+ * 3 = rosc_clksrc_ph, 4 = xosc_clksrc, 5/6 = gpin (no model: left alone). The RP2350
+ * adds an integer divider in CLK_PERI_DIV [31:16]; the RP2040 has none.
+ */
+export function watchRpPeriClock(mcu: RpMcuLike, clocksKey: number, onChange?: () => void): void {
+  const clocks = mcu.peripherals[clocksKey];
+  if (!clocks) return;
+  let auxsrc = 0;
+  let divInt = 1;
+  const apply = (): void => {
+    let hz: number | null;
+    switch (auxsrc) {
+      case 0:
+      case 1:
+        hz = mcu.clkSys;
+        break;
+      case 2:
+        hz = PLL_USB_HZ;
+        break;
+      case 3:
+        hz = ROSC_HZ;
+        break;
+      case 4:
+        hz = XOSC_HZ;
+        break;
+      default:
+        hz = null;
+    }
+    if (hz === null) return;
+    const next = Math.round(hz / Math.max(1, divInt));
+    if (next === mcu.clkPeri) return;
+    mcu.clkPeri = next;
+    onChange?.();
+  };
+  const write = clocks.writeUint32.bind(clocks);
+  clocks.writeUint32 = (offset: number, value: number): void => {
+    write(offset, value);
+    if (offset === CLK_PERI_CTRL) {
+      auxsrc = (value >>> 5) & 0x7;
+      apply();
+    } else if (offset === CLK_PERI_DIV && clocksKey === RP2350_CLOCKS_KEY) {
+      divInt = (value >>> 16) & 0xffff;
+      apply();
+    }
   };
 }
