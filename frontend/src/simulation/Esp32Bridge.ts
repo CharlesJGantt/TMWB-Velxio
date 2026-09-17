@@ -185,6 +185,15 @@ export interface BleStatus {
   status: string;
 }
 
+/** One `chip_framebuffer` event: rows y0..y1 of a chip's RGBA buffer. */
+export interface ChipFramebufferFrame {
+  width: number;
+  height: number;
+  y0: number;
+  y1: number;
+  rowsZlibB64: string;
+}
+
 export class Esp32Bridge {
   readonly boardId: string;
   readonly boardKind: BoardKind;
@@ -279,6 +288,14 @@ export class Esp32Bridge {
         frame: { width: number; height: number; b64: string; refreshMs: number },
       ) => void)
     | null = null;
+  /**
+   * A worker-hosted custom chip painted its framebuffer. The QEMU path runs the
+   * chip's WASM next to the guest, so its pixels arrive here: the RGBA rows
+   * y0..y1 (inclusive) the chip touched since the last flush, zlib-deflated
+   * and base64 (esp32_worker `chip_framebuffer`, ~20 fps ceiling). Routed by
+   * componentId to the chip's element, like ePaper frames.
+   */
+  onChipFramebuffer: ((componentId: string, frame: ChipFramebufferFrame) => void) | null = null;
   onI2cEvent: ((addr: number, data: number) => void) | null = null;
   onI2cTransaction: ((addr: number, data: number[]) => void) | null = null;
   /**
@@ -589,6 +606,18 @@ export class Esp32Bridge {
             height: msg.data.height as number,
             b64: msg.data.frame_b64 as string,
             refreshMs: (msg.data.refresh_ms as number) ?? 50,
+          });
+          break;
+        }
+        case 'chip_framebuffer': {
+          const componentId = msg.data.component_id as string;
+          if (!componentId) break; // an older worker payload: nowhere to route it
+          this.onChipFramebuffer?.(componentId, {
+            width: msg.data.width as number,
+            height: msg.data.height as number,
+            y0: msg.data.y0 as number,
+            y1: msg.data.y1 as number,
+            rowsZlibB64: msg.data.rows_zlib_b64 as string,
           });
           break;
         }
