@@ -72,6 +72,11 @@ import { createSerialBatcher } from './serialBatcher';
 import { emitSerialTap } from './serialTap';
 import { applySerialWireDisplay, applySerialWireTransmit, nominalBaud } from './serialWire';
 import type { SerialLink } from './serialWire';
+
+/** A simulator that publishes the line its console is clocking. */
+type SerialLineReporter = {
+  onBaudRateChange: ((baud: number, link: SerialLink) => void) | null;
+};
 import {
   reensureSerialHooks as icReensureSerialHooks,
   bindBoard as icBindBoard,
@@ -1519,7 +1524,9 @@ function createSimulator(
     sim = new AVRSimulator(pm, 'uno');
   }
   sim.onSerialData = onSerial;
-  if (sim instanceof AVRSimulator) sim.onBaudRateChange = onBaud;
+  // Every simulator that reports its console line (AVR, RP2040, the overlay's RP2350)
+  // carries the same slot; the ESP32 engines report through their bridge instead.
+  if ('onBaudRateChange' in sim) (sim as SerialLineReporter).onBaudRateChange = onBaud;
   sim.onPinChangeWithTime = onPinTime;
   return sim;
 }
@@ -3066,8 +3073,8 @@ export const useSimulatorStore = create<SimulatorState>((set, get) => {
           // previous "re-wire" line was destroying that wrapper and
           // silently breaking sibling-board serial forwarding after
           // every Reset press.
-          if (sim instanceof AVRSimulator) {
-            sim.onBaudRateChange = (baud, link) => {
+          if ('onBaudRateChange' in sim) {
+            (sim as SerialLineReporter).onBaudRateChange = (baud, link) => {
               set((s) => {
                 const boards = s.boards.map((b) =>
                   b.id === boardId
