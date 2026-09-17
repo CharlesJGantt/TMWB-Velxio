@@ -38,6 +38,7 @@
  */
 
 import type { BoardKind } from '../types/board';
+import type { SerialLink } from '../store/serialWire';
 import { MicroPythonSession, type MpyProgram } from './micropythonSession';
 import { getProBoard } from '../lib/proBoardRegistry';
 import { sensorRecordOwnsPin as recordOwnsPin } from './sensorModels';
@@ -91,7 +92,8 @@ export function upsertSensorRecords(
   for (const s of incoming) {
     const idx = merged.findIndex((e) => e['pin'] === s['pin']);
     if (idx < 0) merged.push(s);
-    else merged[idx] = merged[idx]['sensor_type'] === s['sensor_type'] ? { ...merged[idx], ...s } : s;
+    else
+      merged[idx] = merged[idx]['sensor_type'] === s['sensor_type'] ? { ...merged[idx], ...s } : s;
   }
   return merged;
 }
@@ -262,9 +264,8 @@ export class Esp32Bridge {
    * derived from it); the QEMU worker sends the channel only, so it stays
    * optional and the pin-keyed delivery is skipped when it is absent.
    */
-  onWs2812Update:
-    | ((channel: number, pixels: Ws2812Pixel[], pin?: number | null) => void)
-    | null = null;
+  onWs2812Update: ((channel: number, pixels: Ws2812Pixel[], pin?: number | null) => void) | null =
+    null;
   /**
    * ePaper SSD168x backend rendering. Backend decodes SPI traffic in
    * `Ssd168xEpaperSlave` and emits this event on every 0x20
@@ -302,6 +303,14 @@ export class Esp32Bridge {
   onCrash: ((data: Record<string, unknown>) => void) | null = null;
   onWifiStatus: ((status: WifiStatus) => void) | null = null;
   onBleStatus: ((status: BleStatus) => void) | null = null;
+  /**
+   * The console line the guest has programmed — decoded out of the chip's UART
+   * divider by the engine, not guessed from the sketch. null when the console is
+   * not on a wire at all (USB-CDC) or nothing has configured it yet. The store
+   * publishes it on the board so the serial monitor can be honest about a baud
+   * mismatch (see store/serialWire.ts).
+   */
+  onSerialLink: ((link: SerialLink | null) => void) | null = null;
 
   private socket: WebSocket | null = null;
   private _connected = false;
@@ -638,9 +647,9 @@ export class Esp32Bridge {
           // CS-line changes (op == 0x01), but we keep the byte branch
           // for backwards compatibility with older worker builds.
           const event = msg.data.event as number;
-          const op    = (event ?? 0) & 0xFF;
+          const op = (event ?? 0) & 0xff;
           if (op === 0x00) {
-            const mosi = (event >> 8) & 0xFF;
+            const mosi = (event >> 8) & 0xff;
             this.onSpiEvent?.(mosi);
             this.onSpiByte?.(mosi);
           } else if (op === 0x01) {
@@ -951,11 +960,8 @@ export class Esp32Bridge {
    *
    *  Encoding: base64 in JSON. ~10–14 KB per QVGA frame at quality 0.6.
    *  At 10 fps that's ~120 KB/s — trivial over local WS. */
-  sendCameraFrame(jpegBytes: ArrayBuffer | Uint8Array,
-                  width = 320, height = 240): void {
-    const u8 = jpegBytes instanceof Uint8Array
-      ? jpegBytes
-      : new Uint8Array(jpegBytes);
+  sendCameraFrame(jpegBytes: ArrayBuffer | Uint8Array, width = 320, height = 240): void {
+    const u8 = jpegBytes instanceof Uint8Array ? jpegBytes : new Uint8Array(jpegBytes);
     // btoa needs a binary string; build one in 32 KB chunks to avoid
     // "argument size limit" issues with very large frames.
     let binary = '';
