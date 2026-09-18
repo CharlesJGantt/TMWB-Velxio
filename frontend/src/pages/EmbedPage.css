@@ -70,7 +70,13 @@
   text-decoration: underline;
 }
 
-.embed-reset-button {
+.embed-attribution-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.embed-action-button {
   font: inherit;
   font-size: 11px;
   color: var(--color-fg-muted);
@@ -80,12 +86,12 @@
   cursor: pointer;
 }
 
-.embed-reset-button:hover:not(:disabled) {
+.embed-action-button:hover:not(:disabled) {
   color: var(--color-fg-default);
   text-decoration: underline;
 }
 
-.embed-reset-button:disabled {
+.embed-action-button:disabled {
   color: var(--color-fg-subtle);
   cursor: default;
 }

@@ -25,6 +25,7 @@ import { SerialMonitor } from '../components/simulator/SerialMonitor';
 import { useSimulatorStore, DEFAULT_BOARD_POSITION } from '../store/useSimulatorStore';
 import { useProjectStore } from '../store/useProjectStore';
 import { loadProjectFromUrl } from '../utils/loadProjectFromUrl';
+import { runEditorCommand } from '../lib/editorCommands';
 import type { BoardKind } from '../types/board';
 import type { CompilationLog } from '../utils/compilationLogger';
 import '../App.css';
@@ -106,6 +107,14 @@ export const EmbedPage: React.FC = () => {
     }
   };
 
+  // Export/Import are pure client-side (file download / native file picker
+  // via the hidden <input> EditorToolbar already renders) -- no backend, no
+  // account, so they're safe to expose directly in a public embed. Reusing
+  // the same commands the full editor's File menu calls means there's only
+  // one implementation of "what does export/import actually do."
+  const handleExport = () => runEditorCommand('project.exportVlx');
+  const handleImport = () => runEditorCommand('project.import');
+
   useEffect(() => {
     const html = document.documentElement;
     const body = document.body;
@@ -156,14 +165,22 @@ export const EmbedPage: React.FC = () => {
         <a href={REPO_URL} target="_blank" rel="noopener noreferrer">
           Powered by Velxio
         </a>
-        <button
-          type="button"
-          className="embed-reset-button"
-          onClick={handleReset}
-          disabled={resetting}
-        >
-          {resetting ? 'Resetting…' : 'Reset circuit'}
-        </button>
+        <div className="embed-attribution-actions">
+          <button type="button" className="embed-action-button" onClick={handleImport}>
+            Import
+          </button>
+          <button type="button" className="embed-action-button" onClick={handleExport}>
+            Export (.vlx)
+          </button>
+          <button
+            type="button"
+            className="embed-action-button"
+            onClick={handleReset}
+            disabled={resetting}
+          >
+            {resetting ? 'Resetting…' : 'Reset circuit'}
+          </button>
+        </div>
         <a href={openInFullEditorHref} target="_blank" rel="noopener noreferrer">
           Open in full editor ↗
         </a>
