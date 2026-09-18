@@ -70,6 +70,26 @@
   text-decoration: underline;
 }
 
+.embed-reset-button {
+  font: inherit;
+  font-size: 11px;
+  color: var(--color-fg-muted);
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+
+.embed-reset-button:hover:not(:disabled) {
+  color: var(--color-fg-default);
+  text-decoration: underline;
+}
+
+.embed-reset-button:disabled {
+  color: var(--color-fg-subtle);
+  cursor: default;
+}
+
 /* Narrow embeds (a typical article column): stack code above canvas
    instead of squeezing them side by side into unusable slivers. */
 @media (max-width: 700px) {
