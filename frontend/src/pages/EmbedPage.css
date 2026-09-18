@@ -73,25 +73,31 @@
 .embed-attribution-actions {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 6px;
 }
 
 .embed-action-button {
   font: inherit;
   font-size: 11px;
-  color: var(--color-fg-muted);
-  background: none;
+  line-height: 1;
+  color: var(--color-fg-on-action);
+  background: var(--color-action-secondary);
   border: none;
-  padding: 0;
+  border-radius: 4px;
+  padding: 5px 10px;
   cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  white-space: nowrap;
 }
 
 .embed-action-button:hover:not(:disabled) {
-  color: var(--color-fg-default);
-  text-decoration: underline;
+  background: var(--color-action-secondary-hover);
 }
 
 .embed-action-button:disabled {
+  background: var(--color-action-secondary);
   color: var(--color-fg-subtle);
   cursor: default;
 }
