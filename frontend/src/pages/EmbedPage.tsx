@@ -23,9 +23,9 @@ import { EditorToolbar } from '../components/editor/EditorToolbar';
 import { SimulatorCanvas } from '../components/simulator/SimulatorCanvas';
 import { SerialMonitor } from '../components/simulator/SerialMonitor';
 import { useSimulatorStore, DEFAULT_BOARD_POSITION } from '../store/useSimulatorStore';
-import { useProjectStore } from '../store/useProjectStore';
 import { loadProjectFromUrl } from '../utils/loadProjectFromUrl';
 import { runEditorCommand } from '../lib/editorCommands';
+import { clearWorkspaceForStarter } from '../components/editor/NewProjectDialog';
 import type { BoardKind } from '../types/board';
 import type { CompilationLog } from '../utils/compilationLogger';
 import '../App.css';
@@ -46,9 +46,15 @@ async function loadEmbedProject(projectUrl: string | null, boardParam: BoardKind
     await loadProjectFromUrl(projectUrl);
     return;
   }
+  // clearWorkspaceForStarter empties boards/components/wires/file groups --
+  // NOT just clearCurrentProject(), which only touches useProjectStore and
+  // leaves the store's built-in default LED+resistor demo circuit sitting
+  // on the canvas. Unlike the full editor's "New workspace" dialog, an
+  // embed's blank board deliberately skips loading the gallery Blink
+  // example too: a tutorial embedding a bare board wants an EMPTY canvas
+  // to build on, not a pre-wired demo.
+  clearWorkspaceForStarter();
   const sim = useSimulatorStore.getState();
-  useProjectStore.getState().clearCurrentProject();
-  sim.boards.forEach((b) => sim.removeBoard(b.id));
   const newId = sim.addBoard(boardParam, DEFAULT_BOARD_POSITION.x, DEFAULT_BOARD_POSITION.y);
   sim.setActiveBoardId(newId);
 }
