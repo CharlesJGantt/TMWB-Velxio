@@ -349,7 +349,7 @@
   left: 50%;
   transform: translateX(-50%);
   z-index: 100;
-  background: rgba(0, 113, 227, 0.92);
+  background: rgba(16, 94, 251, 0.92);
   color: var(--color-fg-on-action);
   padding: 8px 16px;
   border-radius: 8px;

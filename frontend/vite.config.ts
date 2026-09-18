@@ -51,6 +51,14 @@ export default defineConfig(({ command }) => ({
       },
     },
   },
+  preview: {
+    proxy: {
+      '/api': {
+        target: 'http://127.0.0.1:8001',
+        changeOrigin: true,
+      },
+    },
+  },
   assetsInclude: ['**/*.wasm'],
   optimizeDeps: {
     include: ['avr8js', 'rp2040js', '@wokwi/elements', 'littlefs'],

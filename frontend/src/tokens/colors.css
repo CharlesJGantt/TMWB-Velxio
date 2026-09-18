@@ -35,11 +35,13 @@
   --gray-950: #0a0a0c;
   --gray-1000: #000000;
 
-  /* Primitives — accents */
-  --blue-400:  #4ea8ff;
-  --blue-500:  #0a84ff;
-  --blue-600:  #0071e3;
-  --blue-700:  #0058b3;
+  /* Primitives — accents.
+   * TMWB brand blue (#105EFB) is --blue-600; 400/500/700 are white/black
+   * blends off that base (see branding/README.md if that file gets added). */
+  --blue-400:  #588efc;
+  --blue-500:  #3476fc;
+  --blue-600:  #105efb;
+  --blue-700:  #0c49c4;
 
   --red-500:   #ff453a;
   --red-600:   #d70015;
@@ -120,7 +122,7 @@
    * on every panel depth. In light mode these flip to black at low alpha. */
   --color-wash-hover:    rgba(255, 255, 255, 0.06);
   --color-wash-active:   rgba(255, 255, 255, 0.10);
-  --color-wash-selected: rgba(0, 113, 227, 0.25);
+  --color-wash-selected: rgba(16, 94, 251, 0.25);
 
   /* Semantic — actions */
   /* Solid UI doctrine: interactive surfaces use SOLID fills of these
@@ -134,8 +136,8 @@
   --color-action-secondary-hover: var(--gray-700);
 
   /* Accent washes — tinted backgrounds for selected/active accents. */
-  --color-accent-soft:        rgba(0, 113, 227, 0.14);
-  --color-accent-soft-strong: rgba(0, 113, 227, 0.30);
+  --color-accent-soft:        rgba(16, 94, 251, 0.14);
+  --color-accent-soft-strong: rgba(16, 94, 251, 0.30);
   --color-accent-fg:          var(--blue-400);
 
   /* Semantic — feedback */
@@ -153,7 +155,7 @@
   --color-feedback-error-border:   rgba(255, 69, 58, 0.32);
   --color-feedback-success-border: rgba(48, 209, 88, 0.32);
   --color-feedback-warning-border: rgba(255, 159, 10, 0.32);
-  --color-accent-border:           rgba(0, 113, 227, 0.38);
+  --color-accent-border:           rgba(16, 94, 251, 0.38);
 
   /* Focus ring — used by *:focus-visible across all interactives */
   --color-focus-ring: 0 0 0 2px var(--color-action-primary);
@@ -288,7 +290,7 @@
 
   --color-wash-hover:    rgba(0, 0, 0, 0.05);
   --color-wash-active:   rgba(0, 0, 0, 0.09);
-  --color-wash-selected: rgba(0, 113, 227, 0.16);
+  --color-wash-selected: rgba(16, 94, 251, 0.16);
 
   /* Actions. Hover DARKENS on light (blue-700) where dark LIGHTENS it
    * (blue-500) — hover has to move away from the page, not toward it. */
@@ -298,8 +300,8 @@
   --color-action-secondary:     var(--gray-200);
   --color-action-secondary-hover: var(--gray-300);
 
-  --color-accent-soft:        rgba(0, 113, 227, 0.10);
-  --color-accent-soft-strong: rgba(0, 113, 227, 0.20);
+  --color-accent-soft:        rgba(16, 94, 251, 0.10);
+  --color-accent-soft-strong: rgba(16, 94, 251, 0.20);
   --color-accent-fg:          var(--blue-700);
 
   /* Feedback — the 500s are tuned for contrast against black and go muddy
@@ -316,7 +318,7 @@
   --color-feedback-error-border:   rgba(215, 0, 21, 0.32);
   --color-feedback-success-border: rgba(36, 138, 61, 0.35);
   --color-feedback-warning-border: rgba(201, 52, 0, 0.30);
-  --color-accent-border:           rgba(0, 113, 227, 0.35);
+  --color-accent-border:           rgba(16, 94, 251, 0.35);
 
   --color-tier-free:  var(--gray-600);
   --color-tier-pro:   var(--blue-600);
