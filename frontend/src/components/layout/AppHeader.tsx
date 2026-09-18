@@ -11,7 +11,10 @@ import { trackVisitGitHub, trackVisitDiscord } from '../../utils/analytics';
 import { applyStripLayout, STRIP_BELOW_CLASS } from './headerStripFit';
 import './LanguageSwitcher.css';
 
-const GITHUB_URL = 'https://github.com/davidmonterocrespo24/velxio';
+// AGPLv3 requires that users of this network service can get the exact
+// modified source it's running -- so this must point at OUR fork, not
+// upstream. See LICENSE and the "DUAL LICENSING NOTICE" section in it.
+const GITHUB_URL = 'https://github.com/CharlesJGantt/TMWB-Velxio';
 const DISCORD_URL = 'https://discord.gg/3mARjJrh4E';
 
 interface AppHeaderProps {

@@ -30,7 +30,7 @@
  */
 
 import type { BoardInstance } from '../types/board';
-import type { Component } from '../types/component';
+import type { Component } from '../types/components';
 import type { Wire } from '../types/wire';
 import { useEditorStore, chipFileGroupId } from '../store/useEditorStore';
 import { useSimulatorStore } from '../store/useSimulatorStore';
@@ -182,9 +182,10 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 /**
  * Validate that `data` is shaped like a VlxPayload. Throws VlxParseError
  * on mismatch with a human-readable reason. Keep the checks defensive —
- * users may edit .vlx files by hand or feed us a wrong file by accident.
+ * users may edit .vlx files by hand or feed us a wrong file by accident
+ * (or, for loadProjectFromUrl, a CMS could serve a malformed file).
  */
-function validatePayload(data: unknown): VlxPayload {
+export function validatePayload(data: unknown): VlxPayload {
   if (!isPlainObject(data)) {
     throw new VlxParseError('File is not a JSON object.');
   }
@@ -244,12 +245,12 @@ export async function parseVlxFile(file: File): Promise<VlxPayload> {
 }
 
 /**
- * Convenience wrapper: parse the file AND load its contents into the
- * simulator stores via `loadProjectState`. Returns the parsed payload
- * so the caller can show a confirmation toast or similar.
+ * Load an already-validated VlxPayload into the editor + simulator stores.
+ * Shared by importVlxFile (local file) and loadProjectFromUrl (a URL a
+ * CMS/Drupal embed points at) so the "sever project identity, then load"
+ * sequencing lives in exactly one place.
  */
-export async function importVlxFile(file: File): Promise<VlxPayload> {
-  const payload = await parseVlxFile(file);
+export function loadVlxPayload(payload: VlxPayload): void {
   // CRITICAL — sever the current project identity BEFORE mutating any store
   // (same guard as loadExample.ts). With a saved project open, the auto-save
   // hook would otherwise see the imported content as dirty edits on the OLD
@@ -264,5 +265,15 @@ export async function importVlxFile(file: File): Promise<VlxPayload> {
     wires: payload.wires,
     activeBoardId: payload.activeBoardId,
   });
+}
+
+/**
+ * Convenience wrapper: parse the file AND load its contents into the
+ * simulator stores via `loadProjectState`. Returns the parsed payload
+ * so the caller can show a confirmation toast or similar.
+ */
+export async function importVlxFile(file: File): Promise<VlxPayload> {
+  const payload = await parseVlxFile(file);
+  loadVlxPayload(payload);
   return payload;
 }
