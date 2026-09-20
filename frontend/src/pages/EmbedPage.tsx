@@ -113,13 +113,14 @@ export const EmbedPage: React.FC = () => {
     }
   };
 
-  // Export/Import are pure client-side (file download / native file picker
-  // via the hidden <input> EditorToolbar already renders) -- no backend, no
-  // account, so they're safe to expose directly in a public embed. Reusing
-  // the same commands the full editor's File menu calls means there's only
-  // one implementation of "what does export/import actually do."
+  // Export is pure client-side (a file download) -- no backend, no account,
+  // so it's safe to expose directly in a public embed. Reusing the same
+  // command the full editor's File menu calls means there's only one
+  // implementation of "what does export actually do."
+  // (Import used to sit next to it here too, but a public article embed
+  // isn't the place to let a visitor load an arbitrary .vlx over someone
+  // else's published circuit -- that's the full editor / sandbox's job.)
   const handleExport = () => runEditorCommand('project.exportVlx');
-  const handleImport = () => runEditorCommand('project.import');
 
   useEffect(() => {
     const html = document.documentElement;
@@ -172,9 +173,6 @@ export const EmbedPage: React.FC = () => {
           Powered by Velxio
         </a>
         <div className="embed-attribution-actions">
-          <button type="button" className="embed-action-button" onClick={handleImport}>
-            Import
-          </button>
           <button type="button" className="embed-action-button" onClick={handleExport}>
             Export (.vlx)
           </button>
