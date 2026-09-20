@@ -1257,6 +1257,53 @@ interface Component {
   properties: Record<string, unknown>;
 }
 
+/**
+ * A total, stable stacking order over every board + component, ascending
+ * (index 0 = furthest back). Items with an explicit zOrders entry sort by
+ * that value; everything else falls back to its position in
+ * [...boards, ...components] — the same array order the canvas already
+ * paints in by default, so untouched items don't visually jump the first
+ * time bringForward/sendBackward runs near them.
+ *
+ * Used by bringForward/sendBackward to find "the next item up/down," which
+ * only means something against a real order — zOrders alone is sparse (most
+ * items never get an entry) and can't answer "what's directly above this?"
+ */
+function getLayerOrder(state: {
+  boards: { id: string }[];
+  components: { id: string }[];
+  zOrders: Record<string, number>;
+}): { id: string; rank: number }[] {
+  const all = [...state.boards, ...state.components];
+  return all
+    .map((item, index) => ({
+      id: item.id,
+      rank: state.zOrders[item.id] ?? index,
+    }))
+    .sort((a, b) => a.rank - b.rank);
+}
+
+/**
+ * Same idea as getLayerOrder, but for wires. Wires are a SEPARATE stacking
+ * pool from boards/components — they all paint inside one shared <svg>
+ * (WireLayer), so "forward"/"backward" for a wire only ever means "relative
+ * to the other wires it crosses," never "above/below a specific component."
+ * Reuses the same zOrders map (component ranks are read as a CSS z-index,
+ * wire ranks are only ever compared against other wire ranks here, so the
+ * two never collide even though they share one map).
+ */
+function getWireOrder(state: {
+  wires: { id: string }[];
+  zOrders: Record<string, number>;
+}): { id: string; rank: number }[] {
+  return state.wires
+    .map((wire, index) => ({
+      id: wire.id,
+      rank: state.zOrders[wire.id] ?? index,
+    }))
+    .sort((a, b) => a.rank - b.rank);
+}
+
 // ── Undo/redo history ────────────────────────────────────────────────────
 /**
  * One entry on the canvas undo/redo stack.
@@ -1450,8 +1497,22 @@ interface SimulatorState {
   zOrders: Record<string, number>;
   /** Highest rank handed out so far. */
   zTop: number;
+  /** Lowest rank handed out so far (mirrors zTop for sendToBack). */
+  zBottom: number;
   /** Move an item (board or component id) to the top of the dragged stack. */
   raiseItem: (id: string) => void;
+  /** Right-click "Bring to Front" — same behavior as raiseItem, named for the menu. */
+  bringToFront: (id: string) => void;
+  /** Right-click "Send to Back" — the mirror image of bringToFront. */
+  sendToBack: (id: string) => void;
+  /** Right-click "Bring Forward" — swap with the next item above, one step. */
+  bringForward: (id: string) => void;
+  /** Right-click "Send Backward" — swap with the next item below, one step. */
+  sendBackward: (id: string) => void;
+  /** Wire-only "Bring Forward" — swaps with the next wire up, never a component. */
+  bringWireForward: (wireId: string) => void;
+  /** Wire-only "Send Backward" — swaps with the next wire down, never a component. */
+  sendWireBackward: (wireId: string) => void;
 
   // ── Undo/redo ────────────────────────────────────────────────────────────
   /** Bounded ring buffer of canvas mutations (HISTORY_MAX = 50). */
@@ -3941,6 +4002,7 @@ export const useSimulatorStore = create<SimulatorState>((set, get) => {
 
     zOrders: {},
     zTop: 0,
+    zBottom: 0,
     raiseItem: (id: string) => {
       const s = get();
       // Already on top: re-raising would only churn renders.
@@ -3963,6 +4025,89 @@ export const useSimulatorStore = create<SimulatorState>((set, get) => {
       const zOrders = { ...s.zOrders, [id]: ++top };
       for (const b of seatedOnIt) zOrders[b.id] = ++top;
       set({ zTop: top, zOrders });
+    },
+
+    // ── Right-click layer ordering (Bring to Front / Send to Back / Bring
+    // Forward / Send Backward) ──────────────────────────────────────────────
+    //
+    // raiseItem above only ever grants ranks going up (drag-to-front), so
+    // zOrders is a SPARSE map: most boards/components never get an entry and
+    // fall back to a flat default (isSelected ? 2 : 1) in the render layer.
+    // Forward/backward-by-one only makes sense against a REAL total order, so
+    // every action below first builds one: ranked items keep their zOrders
+    // value, unranked items get a virtual rank equal to their position in
+    // [...boards, ...components] (the same array order that already drives
+    // their default paint order today, so this doesn't reshuffle anything
+    // that hasn't been touched yet).
+    bringToFront: (id: string) => {
+      get().raiseItem(id);
+    },
+
+    sendToBack: (id: string) => {
+      const s = get();
+      if (s.zOrders[id] === s.zBottom && s.zBottom < 0) return;
+      const bottom = s.zBottom - 1;
+      set({ zBottom: bottom, zOrders: { ...s.zOrders, [id]: bottom } });
+    },
+
+    bringForward: (id: string) => {
+      const s = get();
+      const order = getLayerOrder(s);
+      const idx = order.findIndex((o) => o.id === id);
+      if (idx === -1 || idx === order.length - 1) return; // not found, or already topmost
+      const mine = order[idx];
+      const above = order[idx + 1];
+      const zOrders = { ...s.zOrders, [mine.id]: above.rank, [above.id]: mine.rank };
+      set({
+        zOrders,
+        zTop: Math.max(s.zTop, above.rank, mine.rank),
+        zBottom: Math.min(s.zBottom, above.rank, mine.rank),
+      });
+    },
+
+    sendBackward: (id: string) => {
+      const s = get();
+      const order = getLayerOrder(s);
+      const idx = order.findIndex((o) => o.id === id);
+      if (idx <= 0) return; // not found, or already at the bottom
+      const mine = order[idx];
+      const below = order[idx - 1];
+      const zOrders = { ...s.zOrders, [mine.id]: below.rank, [below.id]: mine.rank };
+      set({
+        zOrders,
+        zTop: Math.max(s.zTop, below.rank, mine.rank),
+        zBottom: Math.min(s.zBottom, below.rank, mine.rank),
+      });
+    },
+
+    bringWireForward: (wireId: string) => {
+      const s = get();
+      const order = getWireOrder(s);
+      const idx = order.findIndex((o) => o.id === wireId);
+      if (idx === -1 || idx === order.length - 1) return;
+      const mine = order[idx];
+      const above = order[idx + 1];
+      const zOrders = { ...s.zOrders, [mine.id]: above.rank, [above.id]: mine.rank };
+      set({
+        zOrders,
+        zTop: Math.max(s.zTop, above.rank, mine.rank),
+        zBottom: Math.min(s.zBottom, above.rank, mine.rank),
+      });
+    },
+
+    sendWireBackward: (wireId: string) => {
+      const s = get();
+      const order = getWireOrder(s);
+      const idx = order.findIndex((o) => o.id === wireId);
+      if (idx <= 0) return;
+      const mine = order[idx];
+      const below = order[idx - 1];
+      const zOrders = { ...s.zOrders, [mine.id]: below.rank, [below.id]: mine.rank };
+      set({
+        zOrders,
+        zTop: Math.max(s.zTop, below.rank, mine.rank),
+        zBottom: Math.min(s.zBottom, below.rank, mine.rank),
+      });
     },
 
     recalculateAllWirePositions: () => {

@@ -279,6 +279,15 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
   const recordRotate = useSimulatorStore((s) => s.recordRotate);
   const recordSetProperty = useSimulatorStore((s) => s.recordSetProperty);
   const recordRemoveWire = useSimulatorStore((s) => s.recordRemoveWire);
+  // Right-click layer ordering — not undo-tracked, same as drag-to-front
+  // (raiseItem) already wasn't; z-order is treated as view state, not a
+  // circuit edit.
+  const bringToFront = useSimulatorStore((s) => s.bringToFront);
+  const sendToBack = useSimulatorStore((s) => s.sendToBack);
+  const bringForward = useSimulatorStore((s) => s.bringForward);
+  const sendBackward = useSimulatorStore((s) => s.sendBackward);
+  const bringWireForward = useSimulatorStore((s) => s.bringWireForward);
+  const sendWireBackward = useSimulatorStore((s) => s.sendWireBackward);
   const recordUpdateWire = useSimulatorStore((s) => s.recordUpdateWire);
   // Subscribe to history shape so the undo/redo buttons reactively
   // enable/disable and their tooltips reflect the next command.
@@ -2569,8 +2578,12 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
               top: 0,
               // Drag-to-front rank applies HERE (the group is the stacking
               // context that competes with boards) — see the parts branch.
-              zIndex: (zOrders[component.id] ?? 0) > 0
-                ? 10 + (zOrders[component.id] ?? 0)
+              // Any EXPLICIT rank (including 0 or negative, from Send to
+              // Back / Send Backward) must win over the isSelected/default
+              // fallback below — checking `> 0` here used to silently ignore
+              // zero/negative ranks and send-to-back had no visible effect.
+              zIndex: zOrders[component.id] !== undefined
+                ? 10 + zOrders[component.id]
                 : isSelected
                   ? 2
                   : 1,
@@ -3612,6 +3625,31 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
           const element = document.getElementById(propertyDialogComponentId);
           const pinInfo = element ? (element as any).pinInfo : [];
 
+          const layerActions: InspectorAction[] = interactionRunning
+            ? []
+            : [
+                {
+                  id: 'bring-to-front',
+                  label: t('editor.componentProps.bringToFront'),
+                  onSelect: () => bringToFront(propertyDialogComponentId),
+                },
+                {
+                  id: 'bring-forward',
+                  label: t('editor.componentProps.bringForward'),
+                  onSelect: () => bringForward(propertyDialogComponentId),
+                },
+                {
+                  id: 'send-backward',
+                  label: t('editor.componentProps.sendBackward'),
+                  onSelect: () => sendBackward(propertyDialogComponentId),
+                },
+                {
+                  id: 'send-to-back',
+                  label: t('editor.componentProps.sendToBack'),
+                  onSelect: () => sendToBack(propertyDialogComponentId),
+                },
+              ];
+
           return (
             <PartInspectorDialog
               componentId={propertyDialogComponentId}
@@ -3621,6 +3659,7 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
               pinInfo={pinInfo || []}
               wireInProgress={Boolean(wireInProgress)}
               readOnly={interactionRunning}
+              extraActions={layerActions}
               onClose={() => setShowPropertyDialog(false)}
               onRotate={handleRotateComponent}
               onDelete={(id) => {
@@ -4005,6 +4044,102 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
                     />
                   ))}
                 </div>
+
+                {/* Layer order among OTHER WIRES only — a wire never competes
+                    against a component/board here, the whole wire layer
+                    already paints as one block above/below them (see
+                    WireLayer's wireLayerZIndex). This just decides which
+                    wire draws on top where two wires cross. */}
+                <div
+                  style={{
+                    padding: '8px 4px 2px',
+                    marginTop: 8,
+                    borderTop: '1px solid var(--wb-7)',
+                    color: 'var(--wb-10)',
+                    fontSize: 11,
+                  }}
+                >
+                  {t('editor.componentProps.layerOrder', 'Layer order')}
+                </div>
+                <div style={{ display: 'flex', gap: 4, paddingTop: 4 }}>
+                  {(
+                    [
+                      {
+                        id: 'front',
+                        title: t('editor.componentProps.bringToFront'),
+                        onSelect: () => bringToFront(wireContextMenu.wireId),
+                        path: 'M4 4h11v11H4zM9 9h11v11H9z',
+                      },
+                      {
+                        id: 'forward',
+                        title: t('editor.componentProps.bringForward'),
+                        onSelect: () => bringWireForward(wireContextMenu.wireId),
+                        path: 'M6 14l6-6 6 6M12 8v12',
+                      },
+                      {
+                        id: 'backward',
+                        title: t('editor.componentProps.sendBackward'),
+                        onSelect: () => sendWireBackward(wireContextMenu.wireId),
+                        path: 'M18 10l-6 6-6-6M12 16V4',
+                      },
+                      {
+                        id: 'back',
+                        title: t('editor.componentProps.sendToBack'),
+                        onSelect: () => sendToBack(wireContextMenu.wireId),
+                        path: 'M4 4h11v11H4zM9 9h11v11H9z',
+                      },
+                    ] as const
+                  ).map((action) => (
+                    <button
+                      key={action.id}
+                      type="button"
+                      title={action.title}
+                      onClick={() => {
+                        action.onSelect();
+                        setWireContextMenu(null);
+                      }}
+                      style={{
+                        flex: 1,
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        padding: '6px 0',
+                        background: 'var(--wb-4)',
+                        border: '1px solid var(--wb-7)',
+                        borderRadius: 4,
+                        color: '#e6e6e6',
+                        cursor: 'pointer',
+                      }}
+                      onMouseEnter={(e) => {
+                        e.currentTarget.style.background = 'var(--wb-5)';
+                      }}
+                      onMouseLeave={(e) => {
+                        e.currentTarget.style.background = 'var(--wb-4)';
+                      }}
+                    >
+                      <svg
+                        width="15"
+                        height="15"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      >
+                        <path d={action.path} />
+                        {(action.id === 'front' || action.id === 'back') && (
+                          <path
+                            d={action.id === 'front' ? 'M9 9h11v11H9z' : 'M4 4h11v11H4z'}
+                            fill={action.id === 'front' ? 'currentColor' : 'none'}
+                            fillOpacity={action.id === 'front' ? 0.25 : 1}
+                          />
+                        )}
+                      </svg>
+                    </button>
+                  ))}
+                </div>
+
                 <button
                   type="button"
                   onClick={() => {

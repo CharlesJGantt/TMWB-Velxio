@@ -136,7 +136,10 @@ export const BoardOnCanvas = ({
     [id, boardKind, x, y, components, seatEpoch],
   );
   // Drag-to-front rank: 0 = never dragged (static layering applies).
-  const zRaise = useSimulatorStore((st) => st.zOrders[id] ?? 0);
+  // Keep this undefined when unset (not defaulted to 0 here) — 0 and
+  // negative are both real, explicit ranks now (Send to Back / Send
+  // Backward), and need to be told apart from "never touched."
+  const zRaise = useSimulatorStore((st) => st.zOrders[id]);
 
   // Status dot color: green=running, amber=compiled, gray=idle
   const statusColor = board.running ? '#22c55e' : board.compiledProgram ? '#f59e0b' : '#6b7280';
@@ -237,15 +240,17 @@ export const BoardOnCanvas = ({
       //  - a board SEATED on a socket component (the Round Display / reSpeaker
       //    back header): then the board is the thing you see, the way the
       //    physical XIAO stacks on the shield;
-      //  - a board the user has DRAGGED (zRaise > 0): drag-to-front puts
-      //    whatever you dragged last above everything it overlaps, so a board
-      //    dropped over a part is never lost underneath it — and dragging the
-      //    part afterwards wins the stack right back.
+      //  - a board with an explicit rank (zRaise !== undefined): drag-to-front,
+      //    Bring to Front, or Bring Forward puts it above everything it
+      //    overlaps, so a board dropped over a part is never lost underneath
+      //    it — and Send to Back / dragging the part afterwards wins the
+      //    stack right back. Zero and negative ranks count as explicit too
+      //    (Send to Back / Send Backward can land on either).
       style={{
         position: 'absolute',
         left: 0,
         top: 0,
-        zIndex: zRaise > 0 ? 10 + zRaise : seated ? 3 : 0,
+        zIndex: zRaise !== undefined ? 10 + zRaise : seated ? 3 : 0,
       }}
       onMouseEnter={onMouseEnter}
       onMouseLeave={onMouseLeave}
