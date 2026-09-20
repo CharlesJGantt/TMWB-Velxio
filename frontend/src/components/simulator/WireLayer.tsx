@@ -60,6 +60,34 @@ export const WireLayer: React.FC<WireLayerProps> = ({
   const wireInProgress = useSimulatorStore((s) => s.wireInProgress);
   const selectedWireId = useSimulatorStore((s) => s.selectedWireId);
   const isTouchDevice = useIsCoarsePointer();
+  // A raised component's zIndex is (10 + zOrders[id]), and zOrders[id] can go
+  // as high as zTop (it only ever increments for the life of a project, it
+  // never resets). A fixed zIndex here used to cover that (bumped 1 -> 20 ->
+  // 35 over time to "fix" wires disappearing), but zTop always wins eventually:
+  // any project with enough drag/raise interactions in its history pushes a
+  // component's zIndex past whatever fixed number wires use, and the wire
+  // silently vanishes behind it. Tying this to zTop directly means it can
+  // never be out-raced again, no matter how long a project has been edited.
+  const zTop = useSimulatorStore((s) => s.zTop);
+  const wireLayerZIndex = Math.max(35, 10 + zTop + 1);
+
+  // Wires are all siblings inside ONE <svg> (batched for render performance
+  // rather than one positioned element per wire), so CSS z-index does not
+  // apply between them — plain paint order does: whichever <WireRenderer>
+  // comes LAST in this array draws on top. Bring to Front / Send to Back /
+  // Bring Forward / Send Backward (see the wire context menu) reuse the same
+  // zOrders map components/boards use, since the two never compete against
+  // each other numerically — one is read as a CSS z-index, the other only
+  // ever compares wires against other wires here. Untouched wires keep their
+  // natural array position (ascending id order isn't meaningful — insertion
+  // order is), same fallback pattern as getLayerOrder in the store.
+  const zOrders = useSimulatorStore((s) => s.zOrders);
+  const orderedWires = React.useMemo(() => {
+    return wires
+      .map((wire, index) => ({ wire, rank: zOrders[wire.id] ?? index }))
+      .sort((a, b) => a.rank - b.rank)
+      .map((w) => w.wire);
+  }, [wires, zOrders]);
   // One subscription for the whole layer: WireRenderer reads its outline and
   // selection colours from the token layer at render time, and every wire is
   // a child of this component, so re-rendering here repaints all of them when
@@ -77,10 +105,10 @@ export const WireLayer: React.FC<WireLayerProps> = ({
         height: '100%',
         overflow: 'visible',
         pointerEvents: 'none',
-        zIndex: 35,
+        zIndex: wireLayerZIndex,
       }}
     >
-      {wires.map((wire) => (
+      {orderedWires.map((wire) => (
         <WireRenderer
           key={wire.id}
           wire={wire}
