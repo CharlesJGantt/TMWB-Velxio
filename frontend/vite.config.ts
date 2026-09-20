@@ -1,6 +1,21 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import path from 'path'
+import fs from 'fs'
+
+// Optional local HTTPS for the dev server, off by default. Needed when this
+// dev server is embedded as an <iframe> inside an HTTPS host page (e.g. a
+// local Drupal site on https://*.ddev.site): browsers block that as mixed
+// content if the iframe itself is plain http://, even on localhost. Set
+// VITE_DEV_HTTPS_CERT/VITE_DEV_HTTPS_KEY (e.g. from `mkcert localhost`) to
+// enable it; unset, dev behavior is unchanged.
+const devHttps =
+  process.env.VITE_DEV_HTTPS_CERT && process.env.VITE_DEV_HTTPS_KEY
+    ? {
+        cert: fs.readFileSync(process.env.VITE_DEV_HTTPS_CERT),
+        key: fs.readFileSync(process.env.VITE_DEV_HTTPS_KEY),
+      }
+    : undefined
 
 // https://vite.dev/config/
 // avr8js / rp2040js / @wokwi/elements are resolved from npm via package.json.
@@ -44,6 +59,7 @@ export default defineConfig(({ command }) => ({
     preserveSymlinks: !!process.env.VITE_PRO_BUILD,
   },
   server: {
+    https: devHttps,
     proxy: {
       '/api': {
         target: 'http://127.0.0.1:8001',

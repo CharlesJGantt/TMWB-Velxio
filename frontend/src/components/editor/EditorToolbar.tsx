@@ -6,6 +6,7 @@ import { useEditorStore, chipFileGroupId } from '../../store/useEditorStore';
 import { useSimulatorStore, piRerunScript } from '../../store/useSimulatorStore';
 import { decideEngine } from '../../lib/instantEngine';
 import { blockedByBoardGate } from '../../lib/proBoardGate';
+import { ensureSaveConfig, saveProjectToMediaLibrary } from '../../lib/drupalMediaSave';
 import { useElectricalStore } from '../../store/useElectricalStore';
 import { type VerificationResult } from '../../simulation/verify/circuitVerifier';
 import { verifyCircuitFromStore } from '../../simulation/verify/verifyFromStore';
@@ -1362,6 +1363,40 @@ export const EditorToolbar = ({
     }
   };
 
+  /** Push the current workspace straight to the Drupal media library via
+   *  tmwb_velxio's /api/velxio/save-project, instead of exporting a .vlx
+   *  and importing it there by hand — build in the sandbox, insert into
+   *  an article. Connection (site URL + token) is prompted for once and
+   *  cached in localStorage; see drupalMediaSave.ts. The media/file name
+   *  is prompted every time (pre-filled with the auto-derived default),
+   *  since there's no other place in the editor to set or even see the
+   *  project's slug before it gets used as the saved name. */
+  const handleSaveToMediaLibrary = async () => {
+    const config = ensureSaveConfig();
+    if (!config) return;
+    try {
+      flushChipFileSync();
+      const proj = useProjectStore.getState().currentProject;
+      const defaultName =
+        proj?.slug ??
+        files.find((f) => f.name.endsWith('.ino'))?.name.replace('.ino', '') ??
+        'Untitled Project';
+      const entered = window.prompt('Name for this project in the media library:', defaultName);
+      if (entered === null) return; // cancelled
+      const name = entered.trim() || defaultName;
+      const result = await saveProjectToMediaLibrary(config, { name });
+      setMessage({
+        type: 'success',
+        text: `Saved as "${result.name}" — media #${result.mediaId}. Edit: ${result.editUrl}`,
+      });
+    } catch (err) {
+      setMessage({
+        type: 'error',
+        text: `Save to media library failed: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
+  };
+
   const handleExport = async () => {
     try {
       const { components, wires, boards, activeBoardId, boardPosition, boardType } =
@@ -1658,6 +1693,7 @@ export const EditorToolbar = ({
     import: () => importInputRef.current?.click(),
     export: () => void handleExport(),
     exportVlx: () => handleExportVlx(),
+    saveToMediaLibrary: () => void handleSaveToMediaLibrary(),
     bom: () => void handleExportBom(),
     screenshot: () => void handleExportScreenshot(),
     firmware: () => firmwareInputRef.current?.click(),
@@ -1689,6 +1725,7 @@ export const EditorToolbar = ({
       registerEditorCommand('project.import', () => menuCommandsRef.current.import()),
       registerEditorCommand('project.export', () => menuCommandsRef.current.export()),
       registerEditorCommand('project.exportVlx', () => menuCommandsRef.current.exportVlx()),
+      registerEditorCommand('project.saveToMediaLibrary', () => menuCommandsRef.current.saveToMediaLibrary()),
       registerEditorCommand('project.exportBom', () => menuCommandsRef.current.bom()),
       registerEditorCommand('project.exportScreenshot', () => menuCommandsRef.current.screenshot()),
       registerEditorCommand('firmware.upload', () => menuCommandsRef.current.firmware()),

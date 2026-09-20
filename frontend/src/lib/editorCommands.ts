@@ -23,6 +23,7 @@ export type EditorCommandId =
   | 'project.import'
   | 'project.export'
   | 'project.exportVlx'
+  | 'project.saveToMediaLibrary'
   | 'project.exportBom'
   | 'project.exportScreenshot'
   | 'file.new'
