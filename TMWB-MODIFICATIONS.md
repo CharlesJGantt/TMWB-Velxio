@@ -24,7 +24,7 @@ Run `git diff 1456beaf4ccbf205d5e1c174dccaffbc93fe0105 master --stat` to see the
 
 ## Server side of Save to Media Library
 
-The Drupal endpoint that receives uploads is a separate Drupal module that is not part of this repository. The request format is documented in `frontend/src/lib/drupalMediaSave.ts`. Anyone can implement a compatible endpoint or leave the feature unused.
+Save to Media Library needs a receiving endpoint on a Drupal site. That endpoint is provided by the separate [Velxio Embed Drupal module](https://github.com/CharlesJGantt/velxio_embed) (GPL-2.0-or-later), which requires Drupal 11 or newer. The request format is also documented in `frontend/src/lib/drupalMediaSave.ts`. Without the module the feature does nothing; the rest of the fork does not depend on it.
 
 ## Deployment note
 
