@@ -2,7 +2,7 @@
 
 > **TMWB fork notice:** this is a modified fork of [Velxio](https://github.com/davidmonterocrespo24/velxio) by David Montero Crespo, licensed under AGPLv3, run by [The Makers Workbench](https://themakersworkbench.com). Changes (layer ordering, Save to Media Library, embed mode) are listed with dates in [TMWB-MODIFICATIONS.md](TMWB-MODIFICATIONS.md).
 
-> **"Save to Media Library" requires the Drupal module.** That File-menu feature only works together with the [Velxio Embed Drupal module](https://github.com/CharlesJGantt/velxio_embed), which provides the endpoint that receives the saved project, and it requires a **Drupal 11 or newer** site. Without the module, the menu item has nothing to talk to. Everything else in this fork (layer ordering, embed mode) works on its own.
+> **"Save to Media Library" requires the Drupal module.** That File-menu feature only works together with the [Velxio Embed Drupal module](https://github.com/CharlesJGantt/velxio_embed), which provides the endpoint that receives the saved project, and it requires a **Drupal 10 or 11** site. Without the module, the menu item has nothing to talk to. Everything else in this fork (layer ordering, embed mode) works on its own.
 
 **Live at [velxio.dev](https://velxio.dev)**
 
