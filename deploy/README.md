@@ -20,7 +20,13 @@ tar xzf velxio-frontend-dist.tar.gz -C frontend-dist
 cp <this repo>/deploy/Dockerfile.tmwb-embed ~/Dockerfile.tmwb-embed   # first time, or after the pin changes
 docker build -f Dockerfile.tmwb-embed -t velxio:tmwb-embed .          # no --pull: keep the pinned base
 docker stop velxio && docker rm velxio
-docker run -d --name velxio --restart unless-stopped -p 127.0.0.1:3080:80 \n  -v velxio-data:/app/data \n  -v velxio-arduino-libs:/root/.arduino15 \n  -v velxio-arduino-user-libs:/root/Arduino \n  -v velxio-ccache:/var/cache/ccache \n  -v velxio-build:/var/lib/velxio-build \n  velxio:tmwb-embed
+docker run -d --name velxio --restart unless-stopped -p 127.0.0.1:3080:80 \
+  -v velxio-data:/app/data \
+  -v velxio-arduino-libs:/root/.arduino15 \
+  -v velxio-arduino-user-libs:/root/Arduino \
+  -v velxio-ccache:/var/cache/ccache \
+  -v velxio-build:/var/lib/velxio-build \
+  velxio:tmwb-embed
 ```
 
 The five named volumes and their paths above match the container as deployed on 2026-10-07 (confirmed with `docker inspect velxio`). Reusing the same volume names keeps saved data and the compile and library caches across redeploys. The upstream image's own environment variables apply automatically, so no `-e` flags are needed.
