@@ -1,0 +1,13 @@
+# TMWB overlay: upstream Velxio backend/nginx image + this fork's built frontend.
+#
+# The base image is pinned by digest on purpose. A floating tag such as
+# `:master` silently moves to whatever upstream last pushed, which can put this
+# fork's frontend on a backend it was never built or tested against. This
+# digest is the upstream image that was running in production on 2026-10-07
+# (pulled 2026-09-18).
+#
+# To adopt a newer upstream deliberately: merge upstream into this fork, test
+# locally, then update the digest below (see deploy/README.md).
+FROM ghcr.io/davidmonterocrespo24/velxio:master@sha256:35adfc789fe4da0cd8ad3927d4da1345596f08ec70be88d19cc523361690e5fc
+
+COPY frontend-dist/ /usr/share/nginx/html/
