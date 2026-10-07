@@ -1,5 +1,7 @@
 # Velxio: Arduino & Embedded Board Emulator
 
+> **TMWB fork notice:** this is a modified fork of [Velxio](https://github.com/davidmonterocrespo24/velxio) by David Montero Crespo, licensed under AGPLv3, run by [The Makers Workbench](https://themakersworkbench.com). Changes (layer ordering, Save to Media Library, embed mode) are listed with dates in [TMWB-MODIFICATIONS.md](TMWB-MODIFICATIONS.md).
+
 **Live at [velxio.dev](https://velxio.dev)**
 
 An open-source multi-board emulator and circuit simulator. Write Arduino C++, MicroPython, ESP-IDF or Python, compile it, and run it against real CPU emulation with 150+ interactive electronic components — all in your browser.
