@@ -11,6 +11,7 @@
 import React, { useEffect, useState } from 'react';
 import { useIsCoarsePointer } from '../../utils/useTouchDevice';
 import { rotatePinLocal } from '../../utils/pinPositionCalculator';
+import { readPinInfo } from '../../utils/readPinInfo';
 
 /** Minimum visual pin size in *world* pixels at zoom 1 */
 const PIN_VISUAL = 12;
@@ -51,6 +52,10 @@ interface PinOverlayProps {
    * boxes follow the visually-rotated pin tips.
    */
   rotation?: number;
+  /** Explicit unrotated box to rotate the pins about, top-left at the
+   *  wrapper origin. Boards pass their footprint (no DynamicComponent
+   *  wrapper to measure). */
+  pivotBox?: { w: number; h: number };
   /** True while a wire is in progress — paints every square even on dense
    * components (breadboards) because they're all valid wire targets. */
   wiring?: boolean;
@@ -66,6 +71,7 @@ export const PinOverlay: React.FC<PinOverlayProps> = ({
   wrapperOffsetY = 6,
   zoom = 1,
   rotation = 0,
+  pivotBox,
   wiring = false,
 }) => {
   const [pins, setPins] = useState<PinInfo[]>([]);
@@ -77,8 +83,9 @@ export const PinOverlay: React.FC<PinOverlayProps> = ({
     let timer: ReturnType<typeof setTimeout> | undefined;
     const tryRead = () => {
       const element = document.getElementById(componentId);
-      if (element && (element as any).pinInfo) {
-        setPins((element as any).pinInfo);
+      const info = readPinInfo<PinInfo>(element);
+      if (element && info) {
+        setPins(info);
         // Capture the wrapper's unrotated bounding box for the rotation
         // pivot. offsetWidth/Height stay constant regardless of CSS
         // transforms, so they reflect the LAYOUT box — exactly what
@@ -169,7 +176,7 @@ export const PinOverlay: React.FC<PinOverlayProps> = ({
           pin.x,
           pin.y,
           rotation,
-          wrapperBox,
+          pivotBox ?? wrapperBox,
           wrapperOffsetX,
           wrapperOffsetY,
         );

@@ -15,7 +15,10 @@ stdin  line 2+: JSON commands
                {"cmd": "set_adc_waveform", "channel": N,   "samples_u12_b64": "<base64-LE-uint16>", "period_ns": P}
                {"cmd": "uart_send",        "uart": N,      "data": "<base64>"}
                {"cmd": "set_i2c_response", "addr": N,      "response": V}
-               {"cmd": "set_spi_response", "response": V}
+               {"cmd": "bus_map",          "spi": [{"owner","bus_id","cs","model"}],
+                                           "i2c": [{"owner","bus_id","sda","scl","addresses"}, {"unplaced": [...]}],
+                                           "pulls": [{"pin","pull": "up"|"down","owner"}]}
+               {"cmd": "bus_attrs",        "owner": "...", "attrs": {name: number}}
                {"cmd": "stop"}
 
 stdout        : JSON event lines (one per line, flushed immediately)
@@ -30,7 +33,10 @@ stdout        : JSON event lines (one per line, flushed immediately)
                {"type": "rmt_event",    "channel": N, ...}
                {"type": "ws2812_update","channel": N, "pixels": [...]}
                {"type": "i2c_event",    "bus": N, "addr": N, "event": N, "response": N}
-               {"type": "spi_event",    "bus": N, "event": N, "response": N}
+               {"type": "i2c_trace",    "bus": N, "addr": N, "event": N, "op": "...",
+                                        "result": N, "reg_ptr": N}   # VELXIO_I2C_TRACE=1 only
+               {"type": "spi_event",    "bus": N, "event": N}
+               {"type": "bus_diag",     "code": "...", "bus": N, "owners": [...]}
                {"type": "error",        "message": "..."}
 
 stderr        : debug logs (never part of the JSON protocol)
@@ -111,7 +117,10 @@ try:
         DS1307Slave  as _DS1307Slave,
         DS3231Slave  as _DS3231Slave,
         I2CWriteSink as _I2CWriteSink,
-        ProxySlave   as _ProxySlave,
+        find_build_times as _find_build_times,
+        rtc_slave as _rtc_slave,
+        bmp280_slave as _bmp280_slave,
+        mpu6050_slave as _mpu6050_slave,
     )
 except ImportError:
     # Fallback: direct import when running from backend/ directory as subprocess
@@ -128,39 +137,107 @@ except ImportError:
     _DS1307Slave  = _mod.DS1307Slave   # type: ignore[assignment]
     _DS3231Slave  = _mod.DS3231Slave   # type: ignore[assignment]
     _I2CWriteSink = _mod.I2CWriteSink  # type: ignore[assignment]
-    _ProxySlave   = _mod.ProxySlave    # type: ignore[assignment]
+    _find_build_times = _mod.find_build_times  # type: ignore[assignment]
+    _rtc_slave = _mod.rtc_slave  # type: ignore[assignment]
+    _bmp280_slave = _mod.bmp280_slave  # type: ignore[assignment]
+    _mpu6050_slave = _mod.mpu6050_slave  # type: ignore[assignment]
 
-# SPI slaves (Phase 1: SSD168x ePaper). Same fallback dance — when the worker
-# runs as a subprocess from backend/ the package import won't resolve.
+# The table those slaves answer from, by (controller, address) and removed by
+# identity (project board-buses-2026-09, F5). Same fallback dance.
 try:
-    from app.services.esp32_spi_slaves import (
-        Ssd168xEpaperSlave as _Ssd168xEpaperSlave,
-        Uc8159cEpaperSlave as _Uc8159cEpaperSlave,
-        Uc8179EpaperSlave as _Uc8179EpaperSlave,
+    from app.services.i2c_bus_table import (
+        I2cBusTable as _I2cBusTable,
+        NOT_ROUTED as _I2C_NOT_ROUTED,
+        owner_of as _i2c_owner_of,
     )
 except ImportError:
     import importlib.util, pathlib, sys as _sys
     _here = pathlib.Path(__file__).parent
-    _spec = importlib.util.spec_from_file_location('esp32_spi_slaves', _here / 'esp32_spi_slaves.py')
+    _spec = importlib.util.spec_from_file_location('i2c_bus_table', _here / 'i2c_bus_table.py')
     _mod = importlib.util.module_from_spec(_spec)  # type: ignore[arg-type]
-    # Same dataclass-needs-sys.modules fix as the i2c fallback above.
-    _sys.modules['esp32_spi_slaves'] = _mod
+    _sys.modules['i2c_bus_table'] = _mod
     _spec.loader.exec_module(_mod)  # type: ignore[union-attr]
-    _Ssd168xEpaperSlave = _mod.Ssd168xEpaperSlave  # type: ignore[assignment]
-    _Uc8159cEpaperSlave = _mod.Uc8159cEpaperSlave  # type: ignore[assignment]
-    _Uc8179EpaperSlave = _mod.Uc8179EpaperSlave  # type: ignore[assignment]
+    _I2cBusTable = _mod.I2cBusTable        # type: ignore[assignment]
+    _I2C_NOT_ROUTED = _mod.NOT_ROUTED      # type: ignore[assignment]
+    _i2c_owner_of = _mod.owner_of          # type: ignore[assignment]
 
-# microSD SD-over-SPI slave (synchronous, returns MISO per byte). Same fallback.
+# The UART chips this worker hosts, by the guest UART their wiring puts them
+# on (project board-buses-2026-09, F6). Shared with the STM32 worker.
 try:
-    from app.services.esp32_sd_slave import SdSpiSlave as _SdSpiSlave
+    from app.services.uart_bus_table import (
+        UartBusTable as _UartBusTable,
+        NOT_ROUTED as _UART_NOT_ROUTED,
+        owner_of as _uart_owner_of,
+    )
 except ImportError:
-    import importlib.util as _ilu_sd, pathlib as _pl_sd, sys as _sys_sd
-    _spec_sd = _ilu_sd.spec_from_file_location(
-        'esp32_sd_slave', _pl_sd.Path(__file__).parent / 'esp32_sd_slave.py')
-    _mod_sd = _ilu_sd.module_from_spec(_spec_sd)  # type: ignore[arg-type]
-    _sys_sd.modules['esp32_sd_slave'] = _mod_sd
-    _spec_sd.loader.exec_module(_mod_sd)  # type: ignore[union-attr]
-    _SdSpiSlave = _mod_sd.SdSpiSlave  # type: ignore[assignment]
+    import importlib.util, pathlib, sys as _sys
+    _here = pathlib.Path(__file__).parent
+    _spec = importlib.util.spec_from_file_location('uart_bus_table', _here / 'uart_bus_table.py')
+    _mod = importlib.util.module_from_spec(_spec)  # type: ignore[arg-type]
+    _sys.modules['uart_bus_table'] = _mod
+    _spec.loader.exec_module(_mod)  # type: ignore[union-attr]
+    _UartBusTable = _mod.UartBusTable      # type: ignore[assignment]
+    _UART_NOT_ROUTED = _mod.NOT_ROUTED     # type: ignore[assignment]
+    _uart_owner_of = _mod.owner_of         # type: ignore[assignment]
+
+# The level of the pads a module's pull resistor is on (board-buses.md, "Pull
+# resistors on a line"): QEMU's injection keeps the last level written, and a
+# released line has to go where the module's resistor takes it. Shared with
+# the STM32 worker.
+try:
+    from app.services.pad_model import PadModel as _PadModel
+except ImportError:
+    import importlib.util, pathlib, sys as _sys
+    _here = pathlib.Path(__file__).parent
+    _spec = importlib.util.spec_from_file_location('pad_model', _here / 'pad_model.py')
+    _mod = importlib.util.module_from_spec(_spec)  # type: ignore[arg-type]
+    _sys.modules['pad_model'] = _mod
+    _spec.loader.exec_module(_mod)  # type: ignore[union-attr]
+    _PadModel = _mod.PadModel              # type: ignore[assignment]
+
+# The microSD has no slave of its own here any more (project
+# board-buses-2026-09, F4). It used to be `esp32_sd_slave.SdSpiSlave`, a third
+# hand-kept copy of the SD-over-SPI protocol that had already drifted from the
+# two in the browser. The card now arrives in the bus map like every other
+# responder, as the portable model the tab and the Linux host run too, and it
+# answers through the same chip-select table as the rest.
+
+# The WASM chip runtime, shared by the custom chips the canvas sends as
+# sensors and by the portable responders the browser puts in the SPI bus map
+# (project board-buses-2026-09, F4). Loaded on first use, and by the same
+# two-step the slave modules above use: `app.services` is not always on
+# sys.path inside this subprocess.
+_CHIP_RUNTIME_API: list = []
+
+
+def _chip_runtime_api():
+    """(WasmChipRuntime, decode_blobs, hosted_model_identity), or three Nones
+    when the runtime is not importable here. Cached: a bus map arrives on
+    every membership change and loading wasmtime again per call is not free."""
+    if _CHIP_RUNTIME_API:
+        return _CHIP_RUNTIME_API[0]
+    try:
+        from app.services.wasm_chip_runtime import (  # type: ignore[import-not-found]
+            WasmChipRuntime as _RT, decode_blobs as _blobs,
+            hosted_model_identity as _ident,
+        )
+    except ImportError:
+        try:
+            import importlib.util as _ilu_rt, pathlib as _pl_rt, sys as _sys_rt
+            _spec_rt = _ilu_rt.spec_from_file_location(
+                'wasm_chip_runtime', _pl_rt.Path(__file__).parent / 'wasm_chip_runtime.py')
+            _mod_rt = _ilu_rt.module_from_spec(_spec_rt)  # type: ignore[arg-type]
+            _sys_rt.modules['wasm_chip_runtime'] = _mod_rt
+            _sys_rt.modules.setdefault('app.services.wasm_chip_runtime', _mod_rt)
+            _spec_rt.loader.exec_module(_mod_rt)  # type: ignore[union-attr]
+            _RT, _blobs = _mod_rt.WasmChipRuntime, _mod_rt.decode_blobs
+            _ident = _mod_rt.hosted_model_identity
+        except Exception as _e:  # noqa: BLE001
+            _log(f'[bus_map] no WASM chip runtime here: {_e!r}')
+            _RT, _blobs, _ident = None, None, None
+    _CHIP_RUNTIME_API.append((_RT, _blobs, _ident))
+    return _CHIP_RUNTIME_API[0]
+
 
 # ─── stdout helpers ──────────────────────────────────────────────────────────
 
@@ -224,6 +301,20 @@ def _log(msg: str) -> None:
     """Write a debug message to stderr (invisible to parent's stdout reader)."""
     sys.stderr.write(f'[esp32_worker] {msg}\n')
     sys.stderr.flush()
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, '').strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+# VELXIO_I2C_TRACE=1 in the backend's environment (the worker inherits it):
+# one stderr line and one `i2c_trace` event for every I2C event a model of
+# this worker answers. Off unless asked for, read once. Both are written from
+# the QEMU thread inside the guest's bus transaction, and the log line is a
+# flushed write: measured at about 0.8 ms on top of every register read, and
+# about 1,600 lines a second from a sketch that polls a sensor. Nothing in the
+# tab reads `i2c_trace`; it is there for whoever debugs a driver.
+I2C_TRACE = _env_flag('VELXIO_I2C_TRACE')
 
 
 def refuse_unmodelled_line_sensor(record: dict) -> bool:
@@ -333,18 +424,19 @@ _WIFI_MAC_RANGES = ((0x3ff73000, 0x3ff74000), (0x60033000, 0x60034000))
 
 def wifi_nic_arg(machine: str, wifi_enabled: bool,
                  hostfwd_port: int = 0) -> str | None:
-    """The `-nic` value for this machine, or None if it models no radio.
+    """The `-nic` value for this machine, or None if it gets no radio.
 
-    The radio is attached whether or not the sketch appears to use it, because
-    a real ESP32 has one either way. It used to be conditional on wifi_enabled,
-    which made a source-scanning GUESS load-bearing: the fork only instantiates
-    the MAC when a NIC is present (`qemu_find_nic_info(TYPE_ESP32_WIFI)` in
-    hw/xtensa/esp32.c), so a sketch the scanner misread as WiFi-less ran on a
-    machine with nothing mapped at DR_REG_WIFI_BASE. The firmware's first
-    register touch then took an unmapped-peripheral fault — `Guru Meditation
-    Error (LoadStorePIFAddrError)`, EXCVADDR 0x60033c00 — which reads as a
-    Velxio crash and says nothing about WiFi. That is issue #260, and one bad
-    guess was all it took.
+    On the classic ESP32 the radio is attached whether or not the sketch
+    appears to use it, because a real ESP32 has one either way. It used to be
+    conditional on wifi_enabled, which made a source-scanning GUESS
+    load-bearing: the fork only instantiates the MAC when a NIC is present
+    (`qemu_find_nic_info(TYPE_ESP32_WIFI)` in hw/xtensa/esp32.c), so a sketch
+    the scanner misread as WiFi-less ran on a machine with nothing mapped at
+    DR_REG_WIFI_BASE. The firmware's first register touch then took an
+    unmapped-peripheral fault — `Guru Meditation Error
+    (LoadStorePIFAddrError)`, EXCVADDR 0x60033c00 — which reads as a Velxio
+    crash and says nothing about WiFi. That is issue #260, and one bad guess
+    was all it took.
 
     Measured before making it unconditional, on a sketch that never touches
     WiFi: boot time, guest-clock-vs-real-time and container CPU all unchanged
@@ -353,8 +445,23 @@ def wifi_nic_arg(machine: str, wifi_enabled: bool,
 
     `wifi_enabled` still gates the host forward, which exposes the GUEST's
     server to the host and so belongs to a sketch that actually serves.
+
+    The ESP32-C3 is the exception, and gets its radio only when the sketch
+    uses WiFi. The C3 machine of the fork does not survive the NIC: with an
+    esp32c3_wifi NIC present, esp32c3_init_openeth cold-resets the eFuse
+    device before the machine has realized it (hw/riscv/esp32c3_picsimlab.c),
+    the reset reloads the eFuse mirror, and the mirror is only allocated in
+    realize (hw/nvram/esp_efuse.c). The worker died half a second after
+    launch with `esp_efuse_reload_from_blk: Assertion 's->mirror' failed`, on
+    every C3 run since the radio became unconditional, and the tab stayed at
+    "booting". So on this machine the guess is load-bearing again, the other
+    way round: a sketch the scanner reads as WiFi-less boots, and one that
+    uses WiFi still meets the assertion until the fork realizes the eFuse
+    first or the run brings an eFuse drive of its own.
     """
     if 'c3' in machine:
+        if not wifi_enabled:
+            return None
         model = 'esp32c3_wifi'
     elif machine in _WIFI_MACHINES:
         model = 'esp32_wifi'
@@ -458,6 +565,11 @@ def _decode_rmt_item(value: int) -> tuple[int, int, int, int]:
     return level0, duration0, level1, duration1
 
 
+def _ws281x_bit(high: int, low: int) -> int:
+    """The bit a WS281x pixel reads from `high` ticks up then `low` ticks down."""
+    return 1 if 7 * high > 5 * low else 0
+
+
 class _RmtDecoder:
     """Accumulate RMT items for one channel; flush complete WS2812 frames."""
 
@@ -487,15 +599,22 @@ class _RmtDecoder:
             self._bits.clear()
             return pix or None
 
-        # Classify the bit by comparing the two halves of its own symbol, not
-        # against an absolute tick count. A WS2812 '1' is high-longer-than-low
-        # and a '0' is high-shorter-than-low whatever resolution the driver
-        # picked — the in-browser engine decodes it exactly this way. The old
-        # fixed threshold of 48 ticks was an order of magnitude off for the two
-        # drivers in this image, which both build symbols at 10 MHz with 8 ticks
-        # for a 1 and 4 for a 0, so every bit classified as 0: a black strip.
+        # Classify the bit by the share of its own symbol that is high, not
+        # against an absolute tick count: the resolution is the driver's choice.
+        # The old fixed threshold of 48 ticks was an order of magnitude off for
+        # the two drivers in this image, which both build symbols at 10 MHz with
+        # 8 ticks for a 1 and 4 for a 0, so every bit classified as 0: a black
+        # strip.
+        #
+        # The cut is 5/12 of the symbol, not one half. A pixel samples the line
+        # a fixed time after the rising edge (about 0.48 us), so a '1' only has
+        # to stay high past that point. "High longer than low" read FastLED's
+        # WS2811 and WS2813 as black: their '1' is 640 ns high and 640 ns low,
+        # exactly half. 5/12 sits above the longest '0' any driver emits (1/3)
+        # and below the shortest '1' (1/2). The in-browser engines use the same
+        # rule (ws281xBit).
         if level0 == 1 and dur0 > 0:
-            self._bits.append(1 if dur0 > dur1 else 0)
+            self._bits.append(_ws281x_bit(dur0, dur1))
 
         # Every 24 bits → one GRB pixel → convert to RGB
         while len(self._bits) >= 24:
@@ -568,19 +687,6 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
     initial_sensors   = cfg.get('sensors', [])
     wifi_enabled      = cfg.get('wifi_enabled', False)
     wifi_hostfwd_port = cfg.get('wifi_hostfwd_port', 0)
-    sd_card_cfg       = cfg.get('sd_card')  # {'image_b64': ...} when a microSD is wired
-
-    # microSD card (SD-over-SPI). The frontend builds a FAT16 image (auto-copied
-    # project files + paid uploads) and ships it here; SdSpiSlave serves it
-    # synchronously over the SPI bus (returns MISO per byte). Single-device on
-    # the bus for now — CS gating is a later refinement.
-    _sd_slave = None
-    if sd_card_cfg and sd_card_cfg.get('image_b64'):
-        try:
-            _sd_slave = _SdSpiSlave(base64.b64decode(sd_card_cfg['image_b64']))
-            _log('[sd] microSD attached')
-        except Exception as _e:  # noqa: BLE001
-            _log(f'[sd] failed to attach microSD: {_e!r}')
 
     # Adjust GPIO pinmap based on chip: ESP32-C3 has only 22 GPIOs; the
     # ESP32-S3 has 49 (GPIO0..48). The identity pinmap's length is what
@@ -738,6 +844,22 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
         _emit({'type': 'error', 'message': f'Firmware decode error: {exc}'})
         os._exit(1)
 
+    # When this firmware was built, for a clock chip the sketch sets to
+    # __DATE__ and __TIME__ (esp32_i2c_slaves, decision D7 of project
+    # i2c-model-fidelity-2026-09). Read from the image the first time a
+    # sketch sets a clock: megabytes to look through, and most sketches
+    # never do.
+    _build_times: list = []
+
+    def _firmware_build_times() -> tuple:
+        if not _build_times:
+            try:
+                _build_times.append(tuple(_find_build_times(fw_bytes)))
+            except Exception as e:  # noqa: BLE001
+                _log(f'build time scan failed: {e!r}')
+                _build_times.append(())
+        return _build_times[0]
+
     rom_dir   = os.path.dirname(lib_path).encode()
     args_list = [
         b'qemu',
@@ -762,7 +884,8 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
              '(issue #260), so a pulse-timing driver will time out on it')
 
     # ── WiFi NIC (slirp user-mode networking) ──────────────────────────────
-    # Always present on machines that model a radio — see wifi_nic_arg().
+    # Always present on the classic ESP32, on the C3 only for a sketch that
+    # uses WiFi — see wifi_nic_arg().
     nic_arg = wifi_nic_arg(machine, wifi_enabled, wifi_hostfwd_port)
     if nic_arg:
         args_list.extend([b'-nic', nic_arg.encode()])
@@ -779,31 +902,80 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
     _init_done     = threading.Event()      # set when qemu_init() returns
     _sensors_ready = threading.Event()      # set after pre-registering initial sensors
     _i2c_responses: dict[int, int] = {}     # 7-bit addr → response byte (simple)
-    _i2c_slaves:    dict = {}               # 7-bit addr → I2C slave/sink instance
-    _spi_response   = [0xFF]                # MISO byte for SPI transfers (default)
+    # Every I2C slave/sink this worker hosts, by (controller, address), each
+    # registered under an identity and removed by it (project board-buses-2026-09,
+    # F5). It replaced a dict keyed by address alone, which made Wire and Wire1
+    # one bus and let the cleanup of one device evict another at its address.
+    # A sensor record registers under ('sensor', pin).
+    _i2c_table = _I2cBusTable(emit=lambda ev: _emit(ev) if not _stopped.is_set() else None,
+                              resolve_bus=lambda sda: _resolve_i2c_bus(sda))
+
+    def _i2c_add(gpio: int, record: dict, slave, addr) -> None:
+        """Put a sensor record's slave on the bus under the record's pin, the
+        identity the tab detaches it by. The record's owner links it to the
+        tab's bus map, and a `bus` field on the record names its controller
+        for a caller that knows it directly. `addr` is one address or every
+        address the slave answers (a custom chip can attach several)."""
+        addrs = [addr] if isinstance(addr, int) else list(addr)
+        _i2c_table.add(('sensor', int(gpio)), slave, addrs,
+                       owner=_i2c_owner_of(record), bus=record.get('bus'))
+    # ── SPI bus (project board-buses-2026-09, F4) ─────────────────────────
+    # QEMU asks for the MISO of every byte synchronously and cannot wait for
+    # the tab, so everything that DRIVES MISO runs here, beside the guest. The
+    # browser sends one entry per responder that has a portable model
+    # (`bus_map`, the microSD among them); the custom chips and the e-paper
+    # panels the worker already hosts join the same list. One chip-select table then
+    # decides who answers, exactly as the tab's fabric does for a local
+    # engine: one selected responder answers, several are the wired-AND of
+    # what they drive plus a contention diagnostic, none is the line's idle.
+    # Before F4 each of these was an early return of its own and whichever
+    # came first in this file won the whole bus.
+    SPI_IDLE_MISO = 0xFF
+    _spi_models: list = []        # responders built from the browser's map
+    _spi_resp:   list = []        # every responder on the bus, in one list
+    _spi_sel:    list = []        # the selected ones; recomputed on CS edges
+    _spi_any_bus_id = [False]     # does any entry name one controller?
+    # The byte function of the ONE selected model and the controller it is
+    # pinned to (None: any), when that is the whole answer: a streamed card
+    # read is 515 callbacks a sector, and each layer of _spi_answer costs as
+    # much as the card itself. None sends the byte through _spi_answer.
+    _spi_one: list = [None]
+    # (SoC SPI unit, CS index) -> asserted, from the peripheral's own CS
+    # events. Keyed by unit: the classic ESP32 reports HSPI's and VSPI's CS0
+    # alike, and one must not select a device on the other.
+    _hw_cs: dict[tuple[int, int], bool] = {}
+    # The controller of the last SPI event QEMU reported. A write-only batch
+    # names no controller of its own (see _on_spi_batch), and it is always the
+    # one that just asserted its select or clocked the previous byte.
+    _spi_last_unit: list = [None]
+    _spi_diag_seen: set = set()
+    # What the tab LISTENS to. A byte goes into the batch for the browser only
+    # if some sink there could be selected while it is clocked (F4-SPEC,
+    # "Worker, por byte", step 3). The tab lists the chip selects of every
+    # device it keeps (`sinks` entry of the map); until a map says so, and
+    # whenever it says it cannot tell, everything is forwarded, which is what
+    # the worker did before it knew. `_spi_forward` is kept on edges, like the
+    # selection, so the per-byte cost is one list lookup.
+    _spi_sinks: list = []         # chip selects of the tab's sinks
+    _spi_sinks_known = [False]    # did the last map list them all?
+    _spi_forward = [True]         # does the byte being clocked reach the tab?
+    _pin_dir: dict[int, int] = {}  # last direction the guest reported (1 = output)
+    _blob_drain_lock = threading.Lock()
+    _blob_drain_hook: list = [None]  # _drain_blob_writes, once it exists
 
     # Custom-chip runtimes that registered their respective protocols at chip_setup.
     # Mutated when sensor_type=='custom-chip' is processed in initial_sensors.
-    # Must match wasm_chip_runtime.CHIP_UART; defined locally because that
-    # module is imported lazily (the worker may run without app.services on
-    # sys.path, see the ImportError fallback below).
-    CHIP_UART = 1
-    _chip_uart_runtimes: list = []          # runtimes that called vx_uart_attach
+    # The UART chips, by the guest UART each one is on (F6): a chip hears the
+    # controller whose TX its RX leg is wired to, from the tab's bus map and
+    # the live GPIO matrix, and answers into the same one. Before F6 every
+    # chip resolved its UART once, at vx_uart_attach, from a static table the
+    # frontend guessed, and landed on Serial1 when nothing resolved.
+    _uart_table = _UartBusTable(resolve_tx_pad=lambda pad: _resolve_uart_tx_pad(pad))
 
     _chip_spi_runtimes:  list = []          # runtimes that called vx_spi_attach
     _chip_timer_runtimes: list = []         # runtimes with active timers
     _chip_pin_watch_runtimes: list = []     # runtimes that called vx_pin_watch
     _chip_fb_runtimes: list = []            # runtimes that called vx_framebuffer_init
-
-    # ePaper SSD168x slaves keyed by frontend component_id. The slave decodes
-    # SPI bytes; on MASTER_ACTIVATION it emits an `epaper_update` WS frame.
-    # `dc_pin` / `cs_pin` / `rst_pin` (gpio numbers) are tracked via
-    # `_on_pin_change`; an active slave is one whose `cs_low` is True.
-    _epaper_slaves: dict = {}
-    # Per-slave runtime state keyed identically: dict with keys
-    #   'slave', 'dc_pin', 'cs_pin', 'rst_pin', 'busy_pin', 'cs_low',
-    #   'dc_high', 'refresh_ms'.
-    _epaper_state: dict = {}
 
     # Live GPIO state tracked from QEMU's _on_pin_change callback. Custom-chip
     # runtimes' vx_pin_read consults this to see what the firmware just drove.
@@ -845,6 +1017,10 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
             SIG_LEDC_HS_CH0_OUT_IDX,
             SIG_LEDC_LS_CH_LAST,
             rmt_signal_base,
+            i2c_sda_signals,
+            uart_tx_signals,
+            spi_units,
+            spi_cs_signals,
         )
     except ImportError:
         import importlib.util as _ilu, pathlib as _pl
@@ -859,8 +1035,64 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
         SIG_LEDC_HS_CH0_OUT_IDX = sys.modules['esp32_signals'].SIG_LEDC_HS_CH0_OUT_IDX
         SIG_LEDC_LS_CH_LAST = sys.modules['esp32_signals'].SIG_LEDC_LS_CH_LAST
         rmt_signal_base = sys.modules['esp32_signals'].rmt_signal_base
+        i2c_sda_signals = sys.modules['esp32_signals'].i2c_sda_signals
+        uart_tx_signals = sys.modules['esp32_signals'].uart_tx_signals
+        spi_units = sys.modules['esp32_signals'].spi_units
+        spi_cs_signals = sys.modules['esp32_signals'].spi_cs_signals
     _signal_router = SignalRouter()
     _rmt_sig_base = rmt_signal_base(machine)
+    _i2c_sda_sig = i2c_sda_signals(machine)
+    _uart_tx_sig = uart_tx_signals(machine)
+    _spi_unit_of = spi_units(machine)
+    _spi_cs_sig = spi_cs_signals(machine)
+
+    def _resolve_uart_tx_pad(pad: int) -> int | None:
+        """Which UART the guest transmits on through pad `pad` right now.
+
+        Read off the matrix per byte, for the same reason _resolve_i2c_bus
+        reads it per address phase: `Serial1.begin(9600, SERIAL_8N1, 16, 17)`
+        can move a port at any time, and the tab's static table cannot know.
+        None when the matrix cannot be read (an older libqemu); NOT_ROUTED
+        when it can and no UART drives that pad, which the table treats as
+        "ask the tab": ESP-IDF 5 puts a port on its IO_MUX pins without the
+        matrix (uart_try_set_iomux_pin), so an unrouted pad may still be the
+        one UART0 talks on.
+        """
+        if not _uart_tx_sig or pad < 0 or pad >= _GPIO_COUNT:
+            return None
+        try:
+            out_sel_ptr = lib.qemu_picsimlab_get_internals(2)
+            if not out_sel_ptr:
+                return None
+            out_sel = (ctypes.c_uint32 * _GPIO_COUNT).from_address(out_sel_ptr)
+            unit = _uart_tx_sig.get(int(out_sel[pad]) & 0x1FF)
+        except Exception:  # noqa: BLE001 - an iothread callback never raises
+            return None
+        return _UART_NOT_ROUTED if unit is None else unit
+
+    def _resolve_i2c_bus(sda: int) -> int | None:
+        """Which I2C controller the guest routed to pad `sda` right now.
+
+        The tab names the controller of a target when its static table can,
+        and sends the pad when it cannot (an ESP32's Wire1 has no default pins:
+        `Wire1.begin(25, 26)` is all there is). The matrix is the only place
+        that answer exists, so it is read here, per address phase: the sketch
+        may call begin() with other pins at any time. None when the matrix
+        cannot be read (an older libqemu), which the table treats as "any
+        controller", the behaviour before F5; NOT_ROUTED when it can and no
+        controller drives that pad.
+        """
+        if not _i2c_sda_sig or sda < 0 or sda >= _GPIO_COUNT:
+            return None
+        try:
+            out_sel_ptr = lib.qemu_picsimlab_get_internals(2)
+            if not out_sel_ptr:
+                return None
+            out_sel = (ctypes.c_uint32 * _GPIO_COUNT).from_address(out_sel_ptr)
+            unit = _i2c_sda_sig.get(int(out_sel[sda]) & 0x1FF)
+        except Exception:  # noqa: BLE001 - an iothread callback never raises
+            return None
+        return _I2C_NOT_ROUTED if unit is None else unit
 
     def _gpio_for_rmt_channel(channel: int) -> int | None:
         """Which GPIO an RMT TX channel is routed to, or None.
@@ -994,6 +1226,63 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
     # sketch's business (the Keypad library drives the columns).
     _keypad_by_gpio: dict[int, '_MatrixKeypad'] = {}
 
+    # ── Pads with a module pull (pad_model.py) ───────────────────────────────
+    # The tab maps every board pin a module's resistor is on (`pulls` in the
+    # bus map). When nothing strong drives such a pad (the guest released it,
+    # a chip hosted here let go, no injection holds it) the resistor's level
+    # goes into GPIO_IN, synchronously, inside the GPIO_ENABLE write that
+    # released it, so the guest's next digitalRead sees it. A pad with no
+    # module pull is not touched.
+    def _pad_write(gpio: int, level: int) -> None:
+        lib.qemu_picsimlab_set_pin(gpio + 1, level)
+
+    def _pad_level_moved(gpio: int, level: int) -> None:
+        # What reads pads in this worker hears the resolved level: a chip's
+        # vx_pin_read and its watches (a TM1637 model waits for CLK to rise,
+        # and avishorp's driver raises it by releasing), and a GPIO chip
+        # select. The tab is not told: its own net resolves the same pull
+        # from the direction it already reported.
+        if _pin_state.get(gpio) == level:
+            return
+        _pin_state[gpio] = level
+        for rt in list(_chip_pin_watch_runtimes):
+            try:
+                rt.notify_pin_change(gpio, level)
+            except Exception as e:
+                _log(f'[custom-chip pin_watch] error: {e!r}')
+        _recompute_spi_selection()
+
+    _LINE_OWNED = ('dht22', 'dht11', 'ir-nec', 'hc-sr04')
+
+    def _pad_owned_elsewhere(gpio: int) -> bool:
+        # A line model or a keypad wire answers for its pad on its own clock.
+        if gpio in _keypad_by_gpio:
+            return True
+        for pin, sd in list(_sensors.items()):
+            t = sd.get('type')
+            if t not in _LINE_OWNED:
+                continue
+            if pin == gpio or (t == 'hc-sr04' and int(sd.get('echo_pin', pin + 1)) == gpio):
+                return True
+        return False
+
+    _pads = _PadModel(_pad_write, on_level=_pad_level_moved,
+                      skip=_pad_owned_elsewhere, log=_log)
+
+    def _apply_pull_map(entries) -> None:
+        # From the command loop or the start: under the IO-thread lock, like
+        # set_pin (the level can raise a GPIO interrupt into the guest).
+        if entries is None:
+            return
+        if _lock_iothread:
+            _lock_iothread(b'esp32_worker.py:pulls', 0)
+        try:
+            _pads.set_pulls(entries)
+        finally:
+            if _unlock_iothread:
+                _unlock_iothread()
+        _log(f'[pads] module pulls: {_pads.pulls()}')
+
     def _keypad_apply(changes) -> None:
         for kp_gpio, kp_level in changes:
             lib.qemu_picsimlab_set_pin(kp_gpio + 1, kp_level)
@@ -1054,11 +1343,22 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
             icount_shift_for_run), host time while the VM runs otherwise;
             either way it is the clock the guest measures our pulses with."""
             return _qemu_clock_get_ns(_QEMU_CLOCK_VIRTUAL) / 1000.0
+
+        def _guest_clock_ns() -> int:
+            """The same clock in ns, whole: what a hosted chip's
+            vx_sim_now_nanos answers and its timers are scheduled on
+            (board-buses F7). A chip measuring the sketch's pulses or pacing
+            its own reads the timeline the sketch reads, whatever the host's
+            load; before this the chips ran on the worker's wall clock."""
+            return int(_qemu_clock_get_ns(_QEMU_CLOCK_VIRTUAL))
     except AttributeError:
         _log('libqemu does not export qemu_clock_get_ns; DHT22 pacing uses host time')
 
         def _guest_now_us() -> float:
             return time.perf_counter_ns() / 1000.0
+
+        # No guest clock to hand the chips: they keep host time, as before.
+        _guest_clock_ns = None
 
     class _Dht22Handler:
         """Sync-handler shape over a Dht22Reply: one step per GPIO_IN read."""
@@ -1381,6 +1681,7 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
             return
         gpio = int(_PINMAP[slot]) if 1 <= slot <= _GPIO_COUNT else slot
         _pin_state[gpio] = value & 1
+        _pads.guest_level(gpio, value)
         # Matrix keypad: the output latch of one of its wires moved.
         _kp = _keypad_by_gpio.get(gpio)
         if _kp is not None:
@@ -1406,18 +1707,11 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                 except Exception as e:
                     _log(f'[custom-chip pin_watch] error: {e!r}')
 
-        # ePaper SSD168x: track DC / CS / RST pin states for every slave.
-        # CS rising re-arms the next byte; CS falling activates the slave.
-        # RST falling clears the controller's RAM (active LOW).
-        if _epaper_state:
-            for st in _epaper_state.values():
-                if gpio == st['dc_pin']:
-                    st['dc_high'] = bool(value & 1)
-                elif gpio == st['cs_pin']:
-                    st['cs_low'] = (value & 1) == 0
-                elif gpio == st['rst_pin']:
-                    if (value & 1) == 0:
-                        st['slave'].reset()
+        # A chip select may have just moved. Selection is kept on edges, never
+        # looked up per byte, so this is the one place it changes for a GPIO
+        # select, and it runs on the QEMU thread before the guest can clock
+        # the next byte (project board-buses-2026-09, F4).
+        _recompute_spi_selection()
 
         # Sensor protocol dispatch by type
         with _sensors_lock:
@@ -1515,21 +1809,28 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                 if _dht22_trigger(sensor).on_direction(direction == 1):
                     _dht22_arm(gpio, slot, sensor, 'input release')
         gpio = int(_PINMAP[slot]) if 1 <= slot <= _GPIO_COUNT else slot
+        if direction in (0, 1):
+            _pin_dir[gpio] = direction
+            # A released pad goes where a module's pull takes it, before the
+            # guest's next read; one the guest drives stops being the host's.
+            _pads.guest_dir(gpio, direction == 1)
+            # A sink's select released to an input is one this side can no
+            # longer read (see _sink_may_be_selected).
+            if _spi_sinks_known[0]:
+                _recompute_spi_forward()
         _emit({'type': 'gpio_dir', 'pin': gpio, 'dir': direction})
 
     def _on_uart_tx(uart_id: int, byte_val: int) -> None:
         if _stopped.is_set():
             return
         _emit({'type': 'uart_tx', 'uart': uart_id, 'byte': byte_val})
-        # Dispatch to the custom-chip runtimes bound to THIS UART. A chip binds
-        # to the UART whose TX/RX the diagram wires to it, and to CHIP_UART when
-        # nothing resolves: UART0 is the serial monitor, so a chip listening
-        # there by default would receive the sketch's own console output and its
-        # replies would land in the monitor as garbage.
-        # The chip's on_rx_byte callback runs synchronously in this thread.
-        for rt in _chip_uart_runtimes:
-            if getattr(rt, 'uart_id', CHIP_UART) != uart_id:
-                continue
+        # The custom chips whose RX leg is on the pad THIS controller drives,
+        # asked per byte because the guest can move a port to other pads at
+        # any time (F6). A chip on no controller hears nothing, as its silicon
+        # would on an unwired pad. The chip's on_rx_byte runs synchronously in
+        # this thread, so a reply through vx_uart_write lands before the
+        # guest's next instruction.
+        for rt in _uart_table.runtimes_on(uart_id):
             try:
                 rt.feed_uart_byte(byte_val)
             except Exception as e:
@@ -1631,13 +1932,18 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
 
     def _on_i2c_event(bus_id: int, addr: int, event: int) -> int:
         """Synchronous — must return immediately; called from QEMU thread."""
-        slave = _i2c_slaves.get(addr)
+        # The targets on THIS controller at this address. One is the common
+        # case and answers directly; several are arbitrated like the wire.
+        found = _i2c_table.targets(bus_id, addr)
+        slave = found[0].slave if found else None
         op    = event & 0xFF
         data  = (event >> 8) & 0xFF
         op_name = _I2C_OP_NAME.get(op, f'0x{op:02x}')
 
         if slave is not None:
-            result  = slave.handle_event(event)
+            result  = _i2c_table.event(bus_id, addr, event, found)
+            if not I2C_TRACE:
+                return result
             reg_ptr = getattr(slave, 'reg_ptr', 0)
 
             # Build descriptive annotation
@@ -1652,7 +1958,7 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                 note = ''
 
             slave_type_name = type(slave).__name__
-            if slave_type_name == 'MPU6050Slave':
+            if slave_type_name in ('MPU6050Slave', 'WasmMPU6050Slave'):
                 seq = _i2c_event_seq
                 n   = seq[addr] = seq.get(addr, 0) + 1
                 _log(f'I2C #{n:03d} bus={bus_id} addr=0x{addr:02x} {op_name} {note}')
@@ -1676,7 +1982,7 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
             return result
 
         _log(f'I2C bus={bus_id} addr=0x{addr:02x} event=0x{event:04x} op={op_name} '
-             f'NO_SLAVE registered={list(_i2c_slaves.keys())}')
+             f'NO_SLAVE registered={_i2c_table.addresses()}')
         resp = _i2c_responses.get(addr, 0)
         if not _stopped.is_set():
             _emit({'type': 'i2c_event', 'bus': bus_id, 'addr': addr,
@@ -1711,9 +2017,10 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
     #      buffer forever between transactions. Without this, after a few
     #      drawRGBBitmap calls the firmware advances faster than the
     #      buffer fills, and frames stop appearing on the screen.
-    # MISO is still returned synchronously per byte from _spi_response[0]
-    # because the QEMU master writes can't wait. Frontend Esp32Bridge
-    # unpacks the batch and replays each byte through onSpiByte.
+    # MISO is answered synchronously per byte by the bus table below, because
+    # the QEMU master cannot wait for the tab. The batch is the other half of
+    # the stream: the frontend replays each byte into its own fabric, which
+    # arbitrates the SINKS with the CS and D/C edges that arrive around it.
     _spi_byte_buf       = bytearray()
     _spi_buf_lock       = threading.Lock()
     _SPI_BATCH_FLUSH_AT = 4096
@@ -1733,7 +2040,7 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
         the symbol (CS events stay on, as before)."""
         try:
             lib.qemu_picsimlab_enable_spi_cs_events(
-                1 if (_epaper_state or _chip_spi_runtimes) else 0)
+                1 if (_chip_spi_runtimes or _spi_models) else 0)
         except Exception:
             pass
 
@@ -1748,6 +2055,12 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                 break
             with _spi_buf_lock:
                 _flush_spi_batch_locked()
+            # A model whose select never moves (tied to a rail, or none) has
+            # no deselect edge to send its writes on. Through the hook: this
+            # thread starts before the drain is defined further down.
+            drain = _blob_drain_hook[0]
+            if drain is not None:
+                drain()
 
     threading.Thread(
         target=_spi_flush_timer_loop, daemon=True,
@@ -1778,6 +2091,522 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
         name='esp32-chip-fb-flush',
     ).start()
 
+    # ── SPI arbitration (project board-buses-2026-09, F4) ─────────────────
+
+    def _spi_unit(qemu_id: int) -> int:
+        """The SoC's unit for QEMU's picsimlab_spi id. The ONE place the two
+        numberings meet: everything past this speaks the unit, which is what
+        the tab's bus map names (esp32_signals.SPI_UNIT_BY_QEMU_ID_BY_CHIP)."""
+        return _spi_unit_of.get(int(qemu_id), int(qemu_id))
+
+    _out_sel_view: list = [None]
+
+    def _read_out_sel():
+        """The live gpio_out_sel table, or None when this libqemu cannot say.
+        The table is a static array in libqemu, so the view is made once:
+        this is asked on every chip-select edge, several per SPI byte."""
+        view = _out_sel_view[0]
+        if view is not None:
+            return view
+        try:
+            ptr = lib.qemu_picsimlab_get_internals(2)
+            if not ptr:
+                return None
+            view = (ctypes.c_uint32 * _GPIO_COUNT).from_address(ptr)
+        except Exception:  # noqa: BLE001 - called from QEMU callbacks
+            return None
+        _out_sel_view[0] = view
+        return view
+
+    def _cs_signals(unit, index: int) -> tuple:
+        """The matrix output signal(s) that are CS `index` of `unit` (of any
+        controller when the unit is not known)."""
+        units = _spi_cs_sig.values() if unit is None else [_spi_cs_sig.get(unit, ())]
+        return tuple(sigs[index] for sigs in units if 0 <= index < len(sigs))
+
+    def _pad_carries_cs(gpio: int, unit, index: int):
+        """Is pad `gpio` driven by the controller's own chip select right now?
+
+        True or False from the GPIO matrix; None when the matrix cannot be
+        read or the chip's signals are not known."""
+        sigs = _cs_signals(unit, index)
+        if not sigs or gpio < 0 or gpio >= _GPIO_COUNT:
+            return None
+        out_sel = _read_out_sel()
+        if out_sel is None:
+            return None
+        return (int(out_sel[gpio]) & 0x1FF) in sigs
+
+    def _cs_signal_reaches_a_pad(unit: int, index: int) -> bool:
+        """Does ANY pad carry this chip select? The peripheral asserts its CS
+        lines around every transaction whether or not the matrix routes them
+        anywhere (arduino-esp32 never does unless setHwCs(true)); an edge on a
+        line no pad carries is invisible on the board, so the tab is not told.
+        Unknown (no matrix) counts as yes, which is what the worker did before
+        it could tell."""
+        sigs = _cs_signals(unit, index)
+        if not sigs:
+            return True
+        out_sel = _read_out_sel()
+        if out_sel is None:
+            return True
+        return any((v & 0x1FF) in sigs for v in out_sel[:])
+
+    def _hw_cs_asserted(unit, index: int) -> bool:
+        if unit is None:
+            return any(v for (u, i), v in _hw_cs.items() if i == index)
+        return bool(_hw_cs.get((unit, index), False))
+
+    def _cs_follows_peripheral(cs: dict, unit) -> bool:
+        """Which source a `hw` select's pad follows, as the wire would.
+
+        The tab sends `hw` for a device whose CS is on a pad its static table
+        lists as the controller's CS0 (GPIO 5 is VSPI's), but whether the
+        peripheral drives that pad is the SKETCH's choice: SD.begin(5) drives
+        it with digitalWrite, and the peripheral's own CS then toggles around
+        every byte on no pad at all. So the level comes from where the matrix
+        routes the pad: the controller's CS signal -> the CS events; a GPIO ->
+        the level the guest wrote. When the matrix cannot tell (or routes the
+        pad through IO_MUX, which gpio_out_sel does not show), a pad the guest
+        has written as a GPIO follows that, and one it never wrote follows the
+        peripheral, as before.
+        """
+        gpio = cs.get('gpio')
+        if gpio is None:
+            return True
+        index = int(cs.get('index', 0))
+        if _pad_carries_cs(int(gpio), unit, index):
+            return True
+        return int(gpio) not in _pin_state
+
+    def _gpio_cs_active(cs: dict) -> bool:
+        level = _pin_state.get(int(cs.get('gpio', -1)))
+        if level is None:
+            return False
+        return level == 0 if cs.get('active_low', True) else level == 1
+
+    def _cs_active(cs: dict, unit=None) -> bool:
+        """Is this entry's chip select asserted right now?
+
+        `pin`  a GPIO, read from the state QEMU reports; a pin the guest has
+               never driven reads as floating, which is NOT selected, because
+               a chip whose select nobody drives does not answer on a bench
+               either.
+        `hw`   a pad the tab's table lists as a controller's own chip select.
+               It follows what the pad really carries (_cs_follows_peripheral):
+               the controller's CS events when the matrix routes that signal
+               to it (QEMU moves no GPIO for such a pad), the GPIO level when
+               the sketch drives it as a GPIO. `unit` is the controller the
+               entry is on, so HSPI's CS0 never selects a device on VSPI.
+        `const` tied to a rail, `none` no select line at all (a 74HC595).
+        """
+        kind = cs.get('kind')
+        if kind == 'pin':
+            return _gpio_cs_active(cs)
+        if kind == 'hw':
+            if _cs_follows_peripheral(cs, unit):
+                return _hw_cs_asserted(unit, int(cs.get('index', 0)))
+            return _gpio_cs_active(cs)
+        if kind == 'const':
+            return bool(cs.get('active', False))
+        return kind == 'none'
+
+    def _responder(owner, bus_id, drives, sel, xfer, block=None) -> dict:
+        """One entry of the bus table. `xfer` answers a byte or None when the
+        device leaves MISO alone (a write-only panel), and `block` is the bulk
+        form for a transfer the master clocks in one go."""
+        return {'owner': owner, 'bus_id': bus_id, 'drives': drives,
+                'sel': sel, 'xfer': xfer, 'block': block}
+
+    def _hw_cs_edge(unit: int, index: int, level: int) -> None:
+        """A chip select the peripheral drives itself just moved.
+
+        QEMU reports it here and nowhere else, so this is also the only place
+        a model watching that pad can hear about it, and it is told only when
+        the pad really carries the signal: on a pad the sketch drives as a
+        GPIO the model hears the GPIO edges (_on_pin_change) and nothing else.
+        The microSD ends a command frame on CS rising; the peripheral's CS
+        rises after every byte, so passing those on would cut every command
+        into one-byte frames.
+        """
+        _hw_cs[(unit, index)] = level == 0
+        for r in _spi_models:
+            cs = r.get('cs') or {}
+            if cs.get('kind') != 'hw' or int(cs.get('index', 0)) != index:
+                continue
+            if r.get('bus_id') is not None and r['bus_id'] != unit:
+                continue
+            gpio = cs.get('gpio')
+            rt = r.get('runtime')
+            if gpio is None or rt is None:
+                continue
+            if not _cs_follows_peripheral(cs, unit):
+                continue
+            try:
+                rt.notify_pin_change(int(gpio), level)
+            except Exception as e:  # noqa: BLE001
+                _log(f'[spi] {r["owner"]} raised on a hardware CS edge: {e!r}')
+
+    def _model_responder(entry: dict, rt) -> dict:
+        cs = entry.get('cs') or {'kind': 'none'}
+        bus_id = entry.get('bus_id')
+        unit = None if bus_id is None else int(bus_id)
+        out = _responder(
+            str(entry.get('owner') or 'responder'),
+            unit,
+            True,
+            lambda _cs=cs, _u=unit: _cs_active(_cs, _u),
+            lambda mosi, _rt=rt: _rt.spi_transfer_byte(mosi) & 0xFF,
+        )
+        out['runtime'] = rt
+        out['cs'] = cs
+        # Always a byte 0-255, never None: safe to call with nothing around it.
+        out['fast'] = rt.spi_transfer_byte
+        return out
+
+    def _chip_responder(rt, handle: int = 0) -> dict:
+        # A chip declares its own select through vx_spi_attach; velxio-chip.h
+        # says the bus honours it, and cs = -1 means no select line. Each
+        # handle the chip attached is a device of its own behind its own
+        # select, as in the tab.
+        owner = f'chip:{getattr(rt, "component_id", None) or id(rt)}'
+        return _responder(
+            owner if handle == 0 else f'{owner}:spi{handle}',
+            None, True,
+            lambda _rt=rt, _h=handle: _rt.spi_cs_active(_h),
+            lambda mosi, _rt=rt, _h=handle: _rt.spi_transfer_byte(mosi, _h) & 0xFF,
+        )
+
+    def _rebuild_spi_responders() -> None:
+        """Every device that can be clocked on this board's SPI bus, in ONE
+        list. Called whenever the population changes, never per byte."""
+        resp: list = list(_spi_models)
+        for rt in _chip_spi_runtimes:
+            for h in range(rt.spi_handle_count()):
+                resp.append(_chip_responder(rt, h))
+        _spi_resp[:] = resp
+        _spi_any_bus_id[0] = any(r['bus_id'] is not None for r in resp)
+
+    def _recompute_spi_selection() -> None:
+        """The selected set, kept on chip-select edges rather than looked up
+        per byte: the per-byte cost stays one call to one device (D-007)."""
+        prev = _spi_sel[:]
+        sel = []
+        for r in _spi_resp:
+            try:
+                if r['sel']():
+                    sel.append(r)
+            except Exception as e:  # noqa: BLE001
+                _log(f'[spi] selection check failed for {r["owner"]}: {e!r}')
+        _spi_sel[:] = sel
+        one = sel[0] if len(sel) == 1 else None
+        _spi_one[0] = ((one['fast'], one['bus_id'])
+                       if one is not None and one.get('fast') is not None else None)
+        _recompute_spi_forward()
+        # A model just let go of the bus: whatever it wrote into its storage
+        # during that transaction goes back to the tab now, because the tab no
+        # longer sees the bytes that wrote it (see _spi_forward).
+        for r in prev:
+            if r.get('runtime') is not None and not any(r is x for x in sel):
+                _drain_blob_writes()
+                break
+
+    def _sink_may_be_selected(cs: dict) -> bool:
+        """Could the tab's fabric hold this sink selected right now?
+
+        The answer may be a false yes (a byte forwarded that nobody decodes
+        costs only time) but never a false no (a byte a display needed is gone
+        for good). So a level the guest never wrote, or a pad it released to
+        an input, counts as selected: the tab then reads the pull or whatever
+        another part drives, and this side cannot see either. A pad a
+        controller also drives as its own chip select is selected if EITHER
+        the GPIO or that controller's CS says so, because which of the two the
+        tab believes depends on which one it heard from last.
+        """
+        kind = cs.get('kind')
+        if kind not in ('pin', 'hw'):
+            return True
+        gpio = cs.get('gpio')
+        if gpio is None:
+            return True
+        g = int(gpio)
+        level = _pin_state.get(g)
+        if level is None or _pin_dir.get(g) == 0:
+            return True
+        if (level == 0) == bool(cs.get('active_low', True)):
+            return True
+        return kind == 'hw' and _hw_cs_asserted(None, int(cs.get('index', 0)))
+
+    def _recompute_spi_forward() -> None:
+        if not _spi_sinks_known[0]:
+            _spi_forward[0] = True
+            return
+        for cs in _spi_sinks:
+            if _sink_may_be_selected(cs):
+                _spi_forward[0] = True
+                return
+        _spi_forward[0] = False
+
+    def _apply_spi_sinks(entry) -> None:
+        """The `sinks` entry of a map: `{"all": bool, "cs": [cs, ...]}`.
+        `all` is the tab saying some device it keeps has a select this side
+        cannot follow (none, a rail, a line another part drives), so every
+        byte has to go."""
+        info = entry.get('sinks') if isinstance(entry, dict) else None
+        if not isinstance(info, dict) or info.get('all', True):
+            _spi_sinks[:] = []
+            _spi_sinks_known[0] = False
+            return
+        _spi_sinks[:] = [c for c in (info.get('cs') or []) if isinstance(c, dict)]
+        _spi_sinks_known[0] = True
+
+    def _drain_blob_writes() -> None:
+        """Send the tab the spans the hosted models wrote into their named
+        storage (the card image), as `bus_blob`, the event the Pi relay sends.
+
+        The tab owns the file a blob came from: its card is what the SD panel
+        lists and what the next map ships back here. It used to follow the
+        guest's writes by decoding the relayed bytes; the bytes of a
+        transaction no sink can see are not relayed any more, so the writes
+        travel instead. The lock makes a later drain read later data AND queue
+        its event later, whichever thread runs it, so the tab can never apply
+        an older copy of a span over a newer one."""
+        if not _spi_models or _stopped.is_set():
+            return
+        with _blob_drain_lock:
+            for r in _spi_models:
+                rt = r.get('runtime')
+                if rt is None:
+                    continue
+                try:
+                    dirty = rt.take_blob_dirty()
+                    for name, (lo, hi) in dirty.items():
+                        data = rt.blob_span(name, lo, hi)
+                        if data:
+                            ev = {'type': 'system', 'event': 'bus_blob',
+                                  'owner': r['owner'], 'name': name, 'offset': lo,
+                                  'data': base64.b64encode(data).decode('ascii')}
+                            blob_id = (r.get('blob_ids') or {}).get(name)
+                            if blob_id:
+                                ev['blob_id'] = blob_id
+                            _emit(ev)
+                except Exception as e:  # noqa: BLE001
+                    _log(f'[spi] {r["owner"]}: blob drain failed: {e!r}')
+
+    _blob_drain_hook[0] = _drain_blob_writes
+
+    def _spi_population_changed() -> None:
+        _rebuild_spi_responders()
+        _recompute_spi_selection()
+        _sync_cs_events()
+
+    def _bus_diag(code: str, bus_id: int, owners: list, message: str) -> None:
+        """A diagnostic only this side can see. Reported once per (code, the
+        devices involved) so a contention that lasts a frame is one line and
+        not one line per byte."""
+        key = f'{code}|{",".join(sorted(owners))}'
+        if key in _spi_diag_seen or _stopped.is_set():
+            return
+        _spi_diag_seen.add(key)
+        _emit({'type': 'bus_diag', 'code': code, 'bus': 'spi',
+               'controller': -1 if bus_id is None else int(bus_id),
+               'owners': sorted(owners),
+               'message': message})
+
+    def _spi_selected(bus_id) -> list:
+        """The selected devices a byte on controller `bus_id` (the SoC unit;
+        None: not known) reaches."""
+        if not _spi_any_bus_id[0] or bus_id is None:
+            return _spi_sel
+        return [r for r in _spi_sel if r['bus_id'] is None or r['bus_id'] == bus_id]
+
+    def _spi_answer(bus_id: int, mosi: int) -> int:
+        """The MISO the guest reads for one byte, arbitrated by chip select."""
+        sel = _spi_selected(bus_id)
+        n = len(sel)
+        if n == 0:
+            return SPI_IDLE_MISO
+        if n == 1:
+            r = sel[0]
+            try:
+                value = r['xfer'](mosi)
+            except Exception as e:  # noqa: BLE001
+                _log(f'[spi] {r["owner"]} raised on a byte: {e!r}')
+                return SPI_IDLE_MISO
+            return SPI_IDLE_MISO if value is None else value & 0xFF
+        miso = SPI_IDLE_MISO
+        driving: list = []
+        for r in sel:
+            try:
+                value = r['xfer'](mosi)
+            except Exception as e:  # noqa: BLE001
+                _log(f'[spi] {r["owner"]} raised on a byte: {e!r}')
+                continue
+            if value is None:
+                continue
+            driving.append(r['owner'])
+            miso = value & 0xFF if len(driving) == 1 else miso & (value & 0xFF)
+        if len(driving) > 1:
+            _bus_diag(
+                'spi-contention', bus_id, driving,
+                f'{" and ".join(sorted(driving))} drive MISO at the same time; the guest '
+                f'reads the wired-AND of both, which is what two outputs fighting look like.')
+        return miso
+
+    def _spi_feed_block(bus_id: int, data: bytes) -> None:
+        """A write-only transfer the master clocked in one call. The selection
+        cannot change inside it, so every selected device takes the whole
+        block; the result is what byte-by-byte would have produced."""
+        for r in _spi_selected(bus_id):
+            try:
+                feed = r['block']
+                if feed is not None:
+                    feed(data)
+                else:
+                    for mb in data:
+                        r['xfer'](mb)
+            except Exception as e:  # noqa: BLE001
+                _log(f'[spi] {r["owner"]} raised on a block: {e!r}')
+
+    def _apply_spi_bus_map(entries: list) -> None:
+        """Replace the browser's half of the bus table.
+
+        The tab sends the WHOLE map every time membership changes, so a device
+        that left is gone by being absent rather than by a second message
+        nobody can be sure arrived.
+
+        A device that is still there and still the same device (same artifact,
+        same select, same pins, same card image: `hosted_model_identity`) is
+        KEPT, instance and all, and only takes the map's attributes. The map
+        carries each blob as the tab last knew it, and the card the guest has
+        been writing to is newer than that until its spans reach the tab: a
+        wire moved elsewhere on the canvas in that window used to rebuild the
+        card from the older copy and silently undo the write. The Pi host has
+        kept its models this way from the start (pi_spi_responders.py).
+
+        A model gets the same plumbing a custom chip gets: its pin map, so its
+        own vx_pin_watch on the select line fires (the microSD ends its
+        command frame on CS rising), a reader and a writer for the board pins
+        it is wired to (the XPT2046 drives PENIRQ), and the timer scheduler.
+        """
+        WasmChipRuntime, decode_blobs, model_identity = _chip_runtime_api()
+
+        def _map_pin_writer(gpio: int, value: int, _lib=lib):
+            _lib.qemu_picsimlab_set_pin(gpio + 1, value)
+
+        def _map_pin_reader(gpio: int, _store=_pin_state):
+            # None for a pad the guest never drove: the runtime then reads
+            # the pin's pull, so a select with a pull-up floats deselected
+            # instead of reading 0 (selected) before the sketch touches it.
+            v = _store.get(gpio)
+            return None if v is None else int(v) & 1
+
+        def _map_timer(rt):
+            if rt not in _chip_timer_runtimes:
+                _chip_timer_runtimes.append(rt)
+
+        # What the old models wrote and the tab has not heard yet goes first.
+        # A kept model would send it on its next deselect anyway; a dropped one
+        # has no other chance.
+        _drain_blob_writes()
+        previous = {r['owner']: r for r in _spi_models if r.get('runtime') is not None}
+
+        models: list = []
+        _apply_spi_sinks(None)
+        for entry in entries or []:
+            if isinstance(entry, dict) and 'sinks' in entry:
+                _apply_spi_sinks(entry)
+                continue
+            model = entry.get('model') or {}
+            wasm_b64 = model.get('wasm_b64') or ''
+            owner = str(entry.get('owner') or 'responder')
+            if not wasm_b64 or WasmChipRuntime is None:
+                _log(f'[bus_map] {owner}: no portable model, not hosted here')
+                continue
+            identity = model_identity(model, entry.get('cs'), entry.get('bus_id'))
+            old = previous.get(owner)
+            if old is not None and old.get('identity') == identity \
+                    and not any(m['owner'] == owner for m in models):
+                attrs = {str(k): float(v) for k, v in (model.get('attrs') or {}).items()
+                         if isinstance(v, (int, float)) and not isinstance(v, bool)}
+                if attrs:
+                    try:
+                        old['runtime'].update_attrs(attrs)
+                    except Exception as e:  # noqa: BLE001
+                        _log(f'[bus_map] {owner}: attrs on a kept model failed: {e!r}')
+                models.append(old)
+                continue
+            try:
+                runtime = WasmChipRuntime(
+                    base64.b64decode(wasm_b64),
+                    model.get('attrs') or {},
+                    _emit,
+                    pin_map={str(k): int(v) for k, v in (model.get('pin_map') or {}).items()},
+                    pin_writer=_map_pin_writer,
+                    pin_reader=_map_pin_reader,
+                    timer_scheduler=_map_timer,
+                    blobs=decode_blobs(model.get('blobs')),
+                    component_id=owner,
+                    clock=_guest_clock_ns,
+                )
+                runtime.run_chip_setup()
+            except Exception as e:  # noqa: BLE001
+                _log(f'[bus_map] {owner}: model failed to load: {e!r}')
+                continue
+            if runtime.spi_config is None:
+                _log(f'[bus_map] {owner}: the model declares no SPI, ignored')
+                continue
+            if runtime.has_pin_watches():
+                _chip_pin_watch_runtimes.append(runtime)
+            r = _model_responder(entry, runtime)
+            r['identity'] = identity
+            # Which image the spans this instance writes belong to. The tab
+            # drops a span meant for a card it has since replaced, or the old
+            # card's last sector would land on the new one.
+            r['blob_ids'] = {str(k): str(v) for k, v in
+                             (model.get('blob_ids') or {}).items() if v}
+            models.append(r)
+        # Retire only what did not survive, or a device the user deleted keeps
+        # its watches and its timers. A kept model keeps both: its pending
+        # timer is part of the state that must not be thrown away.
+        kept = {id(r['runtime']) for r in models if r.get('runtime') is not None}
+        for old in previous.values():
+            rt = old.get('runtime')
+            if id(rt) in kept:
+                continue
+            for lst in (_chip_pin_watch_runtimes, _chip_timer_runtimes):
+                while rt in lst:
+                    lst.remove(rt)
+        _spi_models[:] = models
+        _spi_population_changed()
+        _log(f'[bus_map] {len(models)} portable SPI responder(s) hosted here')
+
+    def _apply_spi_bus_attrs(owner: str, attrs) -> None:
+        """One hosted responder's live inputs (`bus_attrs`, project
+        board-buses-2026-09, F4): the finger on a touch panel, a temperature
+        slider, the voltage the tab's circuit solve put on an ADC channel.
+
+        The same update_attrs a custom chip's live controls reach through
+        `sensor_update`; only the key differs, because a bus-map model is
+        known by its owner and has no sensor pin. The model is not rebuilt:
+        vx_attr_read reads the store on every call, so the guest's next byte
+        sees the value. An owner nobody hosts (an update that overtook its
+        map) is dropped, and the map that follows carries the same values.
+        """
+        if not isinstance(attrs, dict):
+            return
+        values = {str(k): float(v) for k, v in attrs.items()
+                  if isinstance(v, (int, float)) and not isinstance(v, bool)}
+        if not values:
+            return
+        for r in _spi_models:
+            if r.get('owner') == owner and r.get('runtime') is not None:
+                try:
+                    r['runtime'].update_attrs(values)
+                except Exception as e:  # noqa: BLE001
+                    _log(f'[bus_attrs] {owner}: update failed: {e!r}')
+                return
+
     def _on_spi_event(bus_id: int, event: int) -> int:
         """Synchronous — must return immediately; called from QEMU thread.
 
@@ -1787,118 +2616,88 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                                                                  (op = low byte = 0x00,
                                                                   MOSI = high byte)
             event = ((((cs_idx & 3) << 1) | level) << 8) | 0x01 → CS line change
-                                                                  (op = 0x01,
-                                                                   ignored by chips
-                                                                   that drive their own
-                                                                   CS via pin_watch)
+                                                                  (op = 0x01)
+
+        `bus_id` is QEMU's id for the controller, which is NOT the unit the
+        bus map names (_spi_unit): it is translated first, and nothing below
+        sees QEMU's number.
+
+        The byte's MISO is the bus table's answer (_spi_answer), and the byte
+        also joins the batch going to the browser when a sink there could be
+        selected (_spi_forward); the tab's own fabric then decides by chip
+        select, with the CS and D/C edges it already receives in order around
+        it. A card read the tab has no sink for stays here: relaying it cost
+        as much as the card itself.
         """
-        # Custom-chip SPI runtimes get first dibs on byte transfers. The chip's
-        # pre-armed buffer holds the next MISO byte; the runtime overwrites it
-        # with the master's MOSI byte and advances. on_done fires when count is
-        # reached.
+        unit = _spi_unit(bus_id)
+        _spi_last_unit[0] = unit
         op   = event & 0xFF
         mosi = (event >> 8) & 0xFF
-        if _chip_spi_runtimes and op == 0x00:
-            for rt in _chip_spi_runtimes:
-                try:
-                    return rt.spi_transfer_byte(mosi) & 0xFF
-                except Exception as e:
-                    _log(f'[custom-chip spi_event] error: {e!r}')
-
-        # ePaper SSD168x panels — feed every byte to the active slave (CS LOW).
-        # ePaper is write-only on MOSI; the panel uses BUSY for status, so we
-        # always respond 0xFF on MISO. Multiple panels on the same bus would
-        # both receive the byte, but the user's wiring + CS gating decide
-        # which slave's `cs_low` is True.
-        if _epaper_state and op == 0x00:
-            any_active = False
-            for st in _epaper_state.values():
-                if st['cs_low']:
-                    any_active = True
-                    try:
-                        st['slave'].feed(mosi, st['dc_high'])
-                    except Exception as e:
-                        _log(f'[epaper spi_event] error: {e!r}')
-            if any_active:
-                return 0xFF
-        # microSD — serve SD-over-SPI synchronously, returning the card's MISO
-        # for this byte (the read path the firmware polls).
-        if _sd_slave is not None and op == 0x00:
-            try:
-                return _sd_slave.transfer(mosi) & 0xFF
-            except Exception as e:
-                _log(f'[sd spi_event] error: {e!r}')
-        resp = _spi_response[0]
-        if _stopped.is_set():
-            return resp
-        # ── Batching path (replaces the per-byte _emit) ─────────────────
-        if op == 0x00:
-            # Byte transfer — append to buffer, flush if oversized.
-            with _spi_buf_lock:
-                _spi_byte_buf.append(mosi)
-                if len(_spi_byte_buf) >= _SPI_BATCH_FLUSH_AT:
-                    _flush_spi_batch_locked()
-        else:
-            # CS-line change. Flush any pending bytes from the previous
-            # transaction so the frontend processes them before the
-            # (rare) CS-state event itself. Then forward the CS event
-            # via the legacy spi_event channel for chips that observe
-            # CS state (e.g. ePaper, custom chips that subscribe to it).
+        if op != 0x00:
+            # CS line change of the peripheral's own chip select. Recorded
+            # before recomputing who is selected; whether it selects anything
+            # depends on which pad, if any, the matrix routes it to.
+            cs_idx = (event >> 9) & 0x3
+            level  = (event >> 8) & 0x1
+            _hw_cs_edge(unit, cs_idx, level)
+            _recompute_spi_selection()
+            if _stopped.is_set():
+                return SPI_IDLE_MISO
+            # The tab hears the edge only if a pad carries it: the peripheral
+            # toggles CS0-CS2 around EVERY transaction even when the sketch
+            # drives its select as a GPIO, and relaying those was six frames a
+            # byte that the tab read as its CS pad moving (2026-09-27: the tab
+            # re-selected its copy of the card per byte and stalled).
+            if not _cs_signal_reaches_a_pad(unit, cs_idx):
+                return SPI_IDLE_MISO
+            # Flush the previous transaction's bytes so the browser processes
+            # them before it sees this edge.
             with _spi_buf_lock:
                 _flush_spi_batch_locked()
-            _emit({'type': 'spi_event', 'bus': bus_id, 'event': event, 'response': resp})
-        return resp
+            _emit({'type': 'spi_event', 'bus': unit, 'event': event})
+            return SPI_IDLE_MISO
+
+        one = _spi_one[0]
+        if one is not None and (one[1] is None or one[1] == unit):
+            try:
+                miso = one[0](mosi)
+            except Exception as e:  # noqa: BLE001
+                _log(f'[spi] {_spi_sel[0]["owner"] if _spi_sel else "?"} raised on a byte: {e!r}')
+                miso = SPI_IDLE_MISO
+        else:
+            miso = _spi_answer(unit, mosi)
+        # The cheap test first: a byte the tab does not get needs no word from
+        # _stopped (a method call per byte, and every sector is 515 of them).
+        if not _spi_forward[0] or _stopped.is_set():
+            return miso
+        with _spi_buf_lock:
+            _spi_byte_buf.append(mosi)
+            if len(_spi_byte_buf) >= _SPI_BATCH_FLUSH_AT:
+                _flush_spi_batch_locked()
+        return miso
 
     def _on_spi_batch(bus_id: int, mosi_ptr, length: int) -> None:
         """Batched write-only SPI transfer — the whole MOSI buffer arrives in a
         single call instead of one picsimlab_spi_event per byte. libqemu only
         invokes this for rx==0 (MISO-ignored) transfers on the host SPI shim, so
-        nothing is returned. Mirrors the per-byte _on_spi_event side effects in
-        bulk: custom-chip runtimes first, then ePaper, then the spi_batch buffer.
-        This is the path that removes ~150k C->Python crossings/frame for TFTs."""
+        nothing is returned. Same arbitration as the per-byte path, in bulk:
+        this is what removes ~150k C->Python crossings/frame for TFTs.
+
+        The C side passes a literal 0 for `bus_id` whichever controller clocked
+        the block (esp32_spi.c and esp32s3_gpspi.c), so it names nothing: the
+        block belongs to the controller of the last event, which asserted its
+        select or clocked the byte before (None, any, before the first one).
+        Taking 0 at its word put every VSPI write on HSPI, and an SD card on
+        VSPI never saw the command bytes arduino-esp32 writes in bulk."""
         if length <= 0 or _stopped.is_set():
             return
         try:
             data = ctypes.string_at(mosi_ptr, length)
         except Exception:
             return
-        # Custom-chip SPI runtimes get first dibs (replay per byte; the chip's
-        # MISO return is discarded because this transfer is write-only).
-        if _chip_spi_runtimes:
-            rt = _chip_spi_runtimes[0]
-            for mb in data:
-                try:
-                    rt.spi_transfer_byte(mb)
-                except Exception as e:
-                    _log(f'[custom-chip spi_batch] error: {e!r}')
+        _spi_feed_block(_spi_last_unit[0], data)
+        if not _spi_forward[0]:
             return
-        # ePaper SSD168x: feed each byte under the current DC to every active
-        # slave (DC is constant for a write-only transaction).
-        if _epaper_state:
-            any_active = False
-            for st in _epaper_state.values():
-                if st['cs_low']:
-                    any_active = True
-                    slave = st['slave']
-                    dc = st['dc_high']
-                    for mb in data:
-                        try:
-                            slave.feed(mb, dc)
-                        except Exception as e:
-                            _log(f'[epaper spi_batch] error: {e!r}')
-            if any_active:
-                return
-        # microSD — capture bulk write-only data (e.g. the 512-byte block sent
-        # after CMD24). MISO is discarded on this path; the slave still advances.
-        if _sd_slave is not None:
-            try:
-                for mb in data:
-                    _sd_slave.feed(mb)
-            except Exception as e:
-                _log(f'[sd spi_batch] error: {e!r}')
-            return
-        # Fast path: bulk-append to the spi_batch buffer (same buffer/flush the
-        # per-byte path uses, so frontend ordering is unchanged).
         with _spi_buf_lock:
             _spi_byte_buf.extend(data)
             if len(_spi_byte_buf) >= _SPI_BATCH_FLUSH_AT:
@@ -1990,7 +2789,8 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
         """Load the chip in `s` (a custom-chip sensor record) into this worker
         and hook it to QEMU's live peripherals. Fills `sensor_data` with the
         runtime and, for an I2C chip, its slave and address."""
-        del gpio  # the slot is the caller's key; the chip itself is pinless
+        # `gpio` is the caller's key for this record, and the identity the
+        # chip's I2C target is registered and removed under.
         # User-supplied chip compiled to WASM. The runtime loads the
         # binary in this same Python process so I2C callbacks fire
         # synchronously when QEMU calls _on_i2c_event — same fidelity
@@ -2040,11 +2840,6 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                 # Each entry: {'pin': <chip pin>, 'net': <net id>,
                 # 'remote': bool}. Absent on older frontends.
                 nets       = s.get('nets', []) or []
-                # {gpio: uart_id} for the UART pins the diagram wires to
-                # this chip, so vx_uart_attach binds to the UART the
-                # sketch actually talks on. Absent on older frontends.
-                uart_map   = {int(k): int(v)
-                              for k, v in (s.get('uart_map', {}) or {}).items()}
                 net_map    = {str(n['pin']): str(n['net'])
                               for n in nets if n.get('pin') and n.get('net')}
                 net_bus    = None
@@ -2057,23 +2852,44 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
 
                 # ── Plumbing: hook the runtime to QEMU's live peripherals ──
                 # GPIO output: chip's vx_pin_write → qemu_picsimlab_set_pin
-                def _chip_pin_writer(gpio: int, value: int, _lib=lib):
-                    _lib.qemu_picsimlab_set_pin(gpio + 1, value)
+                # The chip's identity in the pad model: its drives are strong
+                # until it lets go (vx_pin_set_mode to an input) or leaves.
+                _pad_owner = object()
+                sensor_data['pad_owner'] = _pad_owner
 
-                # GPIO input: chip reads current QEMU pin state.
+                def _chip_pin_writer(gpio: int, value: int, _lib=lib, _o=_pad_owner):
+                    _lib.qemu_picsimlab_set_pin(gpio + 1, value)
+                    _pads.chip_drive(gpio, _o, value)
+
+                def _chip_pin_releaser(gpio: int, _o=_pad_owner):
+                    _pads.chip_release(gpio, _o)
+
+                # GPIO input: chip reads current QEMU pin state; None for a
+                # pad the guest never drove, so the runtime reads the pull.
                 def _chip_pin_reader(gpio: int, _store=_pin_state):
-                    return int(_store.get(gpio, 0)) & 1
+                    v = _store.get(gpio)
+                    return None if v is None else int(v) & 1
 
                 # UART RX: chip's vx_uart_write → inject bytes into firmware UART.
                 # Acquire the iothread lock ONLY if we don't already hold it
                 # (typical case: the chip's vx_uart_write is fired from inside
                 # _on_uart_tx, which is already in the QEMU thread holding the
                 # lock — re-acquiring there triggers an assertion).
-                def _chip_uart_writer(uart_id: int, data: bytes,
+                # The table answers from the wiring the tab mapped and the live
+                # matrix; a chip on no controller writes into the air (F6). The
+                # record itself names no UART any more.
+                _rt_cell: list = [None]
+
+                def _chip_uart_writer(data: bytes,
                                       _lib=lib,
                                       _lock=_lock_iothread,
                                       _unlock=_unlock_iothread,
-                                      _is_locked=_iothread_locked):
+                                      _is_locked=_iothread_locked,
+                                      _cell=_rt_cell):
+                    unit = _uart_table.unit_of(_cell[0])
+                    if unit is None:
+                        return
+                    uart_id = int(unit)
                     buf = (ctypes.c_uint8 * len(data))(*data)
                     need_lock = bool(_lock) and (not _is_locked or not _is_locked())
                     if need_lock:
@@ -2095,32 +2911,42 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                     pin_map=pin_map,
                     pin_writer=_chip_pin_writer,
                     pin_reader=_chip_pin_reader,
+                    pin_releaser=_chip_pin_releaser,
                     uart_writer=_chip_uart_writer,
                     timer_scheduler=_chip_timer_scheduler,
                     net_map=net_map,
                     net_bus=net_bus,
-                    uart_map=uart_map,
                     display=display,
                     component_id=comp_id,
+                    clock=_guest_clock_ns,
+                    # The solved voltage on each wired pad (vx_pin_read_analog),
+                    # published by the tab beside the attrs; absent on older
+                    # frontends, and then every pad reads as in the air.
+                    pad_volts=s.get('pad_volts') if isinstance(s.get('pad_volts'), dict) else None,
                 )
                 runtime.run_chip_setup()
+                _rt_cell[0] = runtime
 
                 if runtime.has_framebuffer():
                     _chip_fb_runtimes.append(runtime)
                     _log(f"[custom-chip] framebuffer chip registered ({comp_id})")
 
                 if runtime.i2c_address is not None:
+                    # One slave for every address the chip attached: the
+                    # table hands each event the address it names.
                     slave = WasmChipI2CSlave(runtime.i2c_address, runtime)
-                    _i2c_slaves[runtime.i2c_address] = slave
+                    _i2c_add(gpio, s, slave, runtime.i2c_addresses)
                     sensor_data['i2c_addr'] = runtime.i2c_address
                     sensor_data['slave']    = slave
-                    _log(f"[custom-chip] I2C slave registered at 0x{runtime.i2c_address:02x}")
+                    _log("[custom-chip] I2C slave registered at "
+                         + ", ".join(f"0x{a:02x}" for a in runtime.i2c_addresses))
                 if runtime.uart_config is not None:
-                    _chip_uart_runtimes.append(runtime)
-                    _log(f"[custom-chip] UART chip registered on UART{runtime.uart_id}")
+                    _uart_table.add(runtime, runtime, owner=_uart_owner_of(s))
+                    _log(f"[custom-chip] UART chip registered "
+                         f"(owner={_uart_owner_of(s)!r}, on the UART the tab's map names)")
                 if runtime.spi_config is not None:
                     _chip_spi_runtimes.append(runtime)
-                    _sync_cs_events()
+                    _spi_population_changed()
                     _log("[custom-chip] SPI chip registered")
                 if runtime.has_pin_watches():
                     _chip_pin_watch_runtimes.append(runtime)
@@ -2138,11 +2964,13 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
 
     def _detach_custom_chip_sensor(sensor_data: dict) -> None:
         """Undo _attach_custom_chip_sensor for a chip removed from the canvas.
-        The I2C slave is popped by the caller (the generic `i2c_addr` rule)."""
+        The I2C target leaves with the caller's generic rule, by the record's
+        pin."""
         rt = sensor_data.get('runtime')
         if rt is None:
             return
-        for lst in (_chip_uart_runtimes, _chip_spi_runtimes,
+        _uart_table.remove(rt)
+        for lst in (_chip_spi_runtimes,
                     _chip_pin_watch_runtimes, _chip_timer_runtimes,
                     _chip_fb_runtimes):
             while rt in lst:
@@ -2154,11 +2982,112 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
             except Exception as e:
                 _log(f'[custom-chip] net unregister failed: {e!r}')
         try:
-            _sync_cs_events()
+            _spi_population_changed()
         except Exception:
             pass
         sensor_data['runtime'] = None
         _log('[custom-chip] detached')
+
+    class _MpuIntPin:
+        """The MPU-6050's INT pad on the GPIO its record names (`int_pin`).
+
+        The twin says what the pad does and when it moves next; this puts it
+        on the pad, as one driver of it in the pad model, so an open-drain INT
+        that lets go leaves the line to its pull. It moves at the bus events
+        that change it (the twin calls on_int_change) and, between them, on
+        the chip timer thread, which asks next_timer_deadline() like any
+        hosted chip's timers and runs on the same guest clock. That thread
+        naps at most _CHIP_TIMER_NAP_MAX_S, so a 50 us pulse lasts until its
+        next look: a sketch that counts pulses sees fewer of them than a
+        board would, one that reads on each edge or on a latched level reads
+        every sample it gets.
+
+        Between two looks of the thread at least _MPU_INT_LOOK_NS of guest
+        time passes before the next sample it waits for (a pulse under way
+        still ends on time). At 8 kHz with DATA_RDY_EN set an edge comes due
+        every 50 or 75 us: waking for each took QEMU's I/O-thread lock about
+        6,000 times a second (the thread could not keep up with 16,000) and
+        delivered one pulse in ten. Now it wakes at most twice a millisecond,
+        at a sample and at the end of its pulse, whatever the rate. A look
+        that finds the pad idle while pulses were started since the last one
+        (the thread woke past the 50 us) puts one pulse on the pad, active
+        then idle, for all of them: a sketch counting DATA_RDY interrupts
+        gets one per look, as a slow ISR would. A latched INT is a level and
+        needs none.
+        """
+
+        def __init__(self, slave, gpio: int) -> None:
+            self.slave = slave
+            self.gpio = gpio
+            self.owner = object()
+            self._last = None
+            # The guest time the thread last looked at the pad.
+            self._looked_ns = None
+            # The twin's pulse count when the pad was last seen or pulsed
+            # (None: a twin that counts none).
+            counter = getattr(slave, 'int_pulses', None)
+            self._pulses = counter() if counter is not None else None
+            slave.on_int_change = self.refresh
+
+        def refresh(self) -> None:
+            pad = self.slave.int_pad()
+            if self._pulses is not None:
+                pulses = self.slave.int_pulses()
+                missed = pulses != self._pulses
+                self._pulses = pulses
+                active, idle = self.slave.int_pad_levels()
+                if missed and pad == idle and active != idle:
+                    # Pulses came and went between two looks: one of them
+                    # reaches the pad, so the guest sees the edge.
+                    self._put(active)
+            if pad != self._last:
+                self._put(pad)
+
+        def _put(self, pad: str) -> None:
+            self._last = pad
+            if pad == 'z':
+                _pads.chip_release(self.gpio, self.owner)
+                return
+            level = 1 if pad == 'high' else 0
+            lib.qemu_picsimlab_set_pin(self.gpio + 1, level)
+            _pads.chip_drive(self.gpio, self.owner, level)
+
+        # The chip timer thread's view of it (see _chip_timer_thread). Asking
+        # the twin the time takes the samples due, so a pad that moved while
+        # the thread was asking is due at once.
+        def next_timer_deadline(self):
+            if self.slave.int_pad() != self._last:
+                return 0
+            # Asking the time takes the samples due: one that pulsed since
+            # the pad was last looked at is owed a pulse, over or not, at the
+            # next look the floor allows.
+            looked = self._looked_ns
+            if self._pulses is not None and self.slave.int_pulses() != self._pulses:
+                return 0 if looked is None else looked + _MPU_INT_LOOK_NS
+            return self.slave.int_wake_ns(
+                None if looked is None else looked + _MPU_INT_LOOK_NS)
+
+        def fire_due_timers(self) -> None:
+            self._looked_ns = _chip_now_ns()
+            self.refresh()
+
+    # The least guest time between two looks of the chip timer thread at an
+    # INT pad, 1 ms: the sample period at 1 kHz, the fastest rate with the
+    # low-pass filter on and the one DATA_RDY sketches run at (see
+    # _MpuIntPin). A faster chip is looked at on every sample that falls
+    # past it.
+    _MPU_INT_LOOK_NS = 1_000_000
+
+    def _mpu_int_attach(sensor_data: dict, slave, record: dict) -> None:
+        """Drive the pad INT is wired to, when the tab says it is wired."""
+        pin = record.get('int_pin')
+        if isinstance(pin, bool) or not isinstance(pin, int) or pin < 0:
+            return
+        drv = _MpuIntPin(slave, pin)
+        sensor_data['int_driver'] = drv
+        # The detach path releases every pad this owner drove.
+        sensor_data['pad_owner'] = drv.owner
+        _chip_timer_runtimes.append(drv)
 
     for s in initial_sensors:
         gpio = int(s.get('pin', 0))
@@ -2176,169 +3105,65 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
             # For I2C sensors, also create the slave state machine immediately
             # so _on_i2c_event can find it when the firmware's Wire.begin() runs.
             elif sensor_type == 'mpu6050':
-                i2c_addr = int(s.get('addr', 0x68))
-                slave = _MPU6050Slave(i2c_addr)
-                _i2c_slaves[i2c_addr] = slave
+                i2c_addr = _MPU6050Slave.address_of(s)
+                # On the guest's clock, the one the chips' timers run on: the
+                # part's compiled model when the record carries it
+                # (buses/models/mpu6050.c), the twin otherwise. The record
+                # carries where the panel's sliders are, so the first read is
+                # already theirs and not the model's own rest.
+                slave = _mpu6050_slave(s, now_ns=_guest_clock_ns)
+                _i2c_add(gpio, s, slave, i2c_addr)
+                _mpu_int_attach(sensor_data, slave, s)
                 sensor_data['i2c_addr'] = i2c_addr
                 sensor_data['slave'] = slave
             elif sensor_type == 'bmp280':
                 i2c_addr = int(s.get('addr', 0x76))
-                slave = _BMP280Slave(i2c_addr)
-                if 'temperature' in s: slave.update(float(s['temperature']), slave._press_hpa)
-                if 'pressure'    in s: slave.update(slave._temp_c, float(s['pressure']))
-                _i2c_slaves[i2c_addr] = slave
+                # The part's compiled model when the record carries it
+                # (buses/models/bmp280.c), the twin otherwise. As for the
+                # MPU-6050: the record carries where the panel's sliders are.
+                slave = _bmp280_slave(s)
+                _i2c_add(gpio, s, slave, i2c_addr)
                 sensor_data['i2c_addr'] = i2c_addr
                 sensor_data['slave'] = slave
             elif sensor_type in ('ds1307', 'ds3231'):
                 i2c_addr = int(s.get('addr', 0x68))
-                slave = _DS3231Slave() if sensor_type == 'ds3231' else _DS1307Slave()
-                _i2c_slaves[i2c_addr] = slave
+                # The record carries the tab's clock, and the panel's
+                # temperature for the DS3231, so the first read is already
+                # what the tab's model shows.
+                slave = _rtc_slave(sensor_type, s, _firmware_build_times)
+                _i2c_add(gpio, s, slave, i2c_addr)
                 sensor_data['i2c_addr'] = i2c_addr
                 sensor_data['slave'] = slave
-            elif sensor_type == 'epaper-ssd168x':
-                # ePaper panel: backend decodes SPI traffic and emits
-                # `epaper_update` events with the latched framebuffer.  The
-                # `controller_family` payload field selects the decoder
-                # ('ssd168x' or 'uc8159c') and ALSO determines the BUSY
-                # polarity, because the two controller families use opposite
-                # active levels in GxEPD2:
-                #
-                #   SSD168x family (1.54 / 2.13 / 2.9 / 4.2"):
-                #     `_busy_level = HIGH` → BUSY=HIGH means "busy",
-                #                            BUSY=LOW means "ready".
-                #
-                #   UltraChip family — UC8159c (5.65" ACeP) and UC8179/GD7965
-                #   (7.5" 800x480): `_busy_level = LOW` → BUSY=LOW means "busy",
-                #                            BUSY=HIGH means "ready".
-                #
-                # Pick the IDLE level per family and (a) seed the pin to IDLE
-                # at registration so the firmware's first `_waitBusy()` —
-                # which runs inside `_PowerOn()` / `_InitDisplay()` BEFORE any
-                # frame is sent — sees "ready" and proceeds, and (b) use that
-                # polarity when pulsing on frame flush below.
-                comp_id = str(s.get('component_id', f'epaper-{gpio}'))
-                width = int(s.get('width', 200))
-                height = int(s.get('height', 200))
-                refresh_ms = int(s.get('refresh_ms', 50))
-                busy_pin = int(s.get('busy_pin', -1))
-                # Read controller_family early; default to ssd168x for
-                # back-compat with old frontends that didn't send it.
-                ctl_family_early = str(s.get('controller_family', 'ssd168x'))
-                # UltraChip controllers (uc8159c, uc8179) idle BUSY HIGH; the
-                # SSD168x family idles BUSY LOW.
-                busy_idle_level = 1 if ctl_family_early in ('uc8159c', 'uc8179') else 0
-                busy_busy_level = 1 - busy_idle_level
-                if busy_pin is not None and busy_pin >= 0:
-                    try:
-                        lib.qemu_picsimlab_set_pin(busy_pin + 1, busy_idle_level)
-                    except Exception:
-                        pass
-
-                def _flush_factory(_comp_id=comp_id,
-                                   _w=width, _h=height,
-                                   _refresh=refresh_ms,
-                                   _busy=busy_pin,
-                                   _busy_busy=busy_busy_level,
-                                   _busy_idle=busy_idle_level,
-                                   _lib=lib):
-                    """Build an on_flush callback bound to this slave's
-                    component_id so the WS event can route to the right panel.
-                    Pulses BUSY to its "busy" level for refresh_ms, then back
-                    to "ready" — polarity per controller family (see above)."""
-                    def _on_flush(frame):
-                        try:
-                            frame_b64 = base64.b64encode(frame.pixels).decode('ascii')
-                        except Exception:
-                            return
-                        # NOTE: emit FLAT (fields at top level), like every other
-                        # worker event. The backend's qemu_callback re-wraps the
-                        # post-'type' payload under 'data' (simulation.py), so a
-                        # nested 'data' here would double-wrap and the frontend's
-                        # msg.data.component_id would be undefined (panel never
-                        # renders). This was the long-standing "ESP32 ePaper is
-                        # blank" bug.
-                        _emit({
-                            'type': 'epaper_update',
-                            'component_id': _comp_id,
-                            'width': _w,
-                            'height': _h,
-                            'frame_b64': frame_b64,
-                            'refresh_ms': _refresh,
-                        })
-                        if _busy is not None and _busy >= 0:
-                            try:
-                                _lib.qemu_picsimlab_set_pin(_busy + 1, _busy_busy)
-
-                                def _busy_idle_cb(_b=_busy, _lvl=_busy_idle):
-                                    try:
-                                        _lib.qemu_picsimlab_set_pin(_b + 1, _lvl)
-                                    except Exception:
-                                        pass
-
-                                threading.Timer(_refresh / 1000.0, _busy_idle_cb).start()
-                            except Exception:
-                                pass
-                    return _on_flush
-
-                # Pick the decoder family from the payload. Defaults to
-                # SSD168x for backward compatibility (initial frontends only
-                # sent SSD168x); the UC8159c value is sent for ACeP panels.
-                ctl_family = str(s.get('controller_family', 'ssd168x'))
-                if ctl_family == 'uc8159c':
-                    slave = _Uc8159cEpaperSlave(
-                        component_id=comp_id, width=width, height=height,
-                        on_flush=_flush_factory(),
-                    )
-                elif ctl_family == 'uc8179':
-                    slave = _Uc8179EpaperSlave(
-                        component_id=comp_id, width=width, height=height,
-                        on_flush=_flush_factory(),
-                    )
-                else:
-                    _is_bwr = 'bwr' in str(s.get('panel_kind', '')).lower()
-                    slave = _Ssd168xEpaperSlave(
-                        component_id=comp_id, width=width, height=height,
-                        on_flush=_flush_factory(), is_bwr=_is_bwr,
-                    )
-                state = {
-                    'slave': slave,
-                    'dc_pin': int(s.get('dc_pin', -1)),
-                    'cs_pin': int(s.get('cs_pin', -1)),
-                    'rst_pin': int(s.get('rst_pin', -1)),
-                    'busy_pin': busy_pin,
-                    'cs_low': False,
-                    'dc_high': False,
-                    'refresh_ms': refresh_ms,
-                    'controller_family': ctl_family,
-                }
-                _epaper_slaves[comp_id] = slave
-                _epaper_state[comp_id] = state
-                _sync_cs_events()
-                sensor_data['epaper_component_id'] = comp_id
-                _log(f"[epaper:{ctl_family}] registered '{comp_id}' "
-                     f"({width}x{height}) "
-                     f"DC={state['dc_pin']} CS={state['cs_pin']} "
-                     f"RST={state['rst_pin']} BUSY={state['busy_pin']}")
             elif sensor_type in ('ssd1306', 'pcf8574', 'i2c-write-sink'):
                 # 'i2c-write-sink' is the generic form: any write-only device
                 # whose rendering lives in the browser (the Grove display
                 # chips) is ACKed here and its bytes echoed as i2c_transaction.
-                default_addr = 0x3C if sensor_type == 'ssd1306' else 0x27
-                i2c_addr = int(s.get('addr', default_addr))
-                sink = _I2CWriteSink(i2c_addr, _emit)
-                _i2c_slaves[i2c_addr] = sink
+                sink = _I2CWriteSink.from_record(sensor_type, s, _emit)
+                i2c_addr = sink.addr
+                _i2c_add(gpio, s, sink, i2c_addr)
                 sensor_data['i2c_addr'] = i2c_addr
                 sensor_data['slave'] = sink
             elif sensor_type == 'custom-chip':
                 _attach_custom_chip_sensor(gpio, s, sensor_data)
             _sensors[gpio] = sensor_data
     _sensors_ready.set()
-    _log(f'_i2c_slaves registered: {list(_i2c_slaves.keys())}')
+    _log(f'I2C targets registered: {_i2c_table.addresses()}')
 
+    # Now that the initial components are registered, build the SPI bus table
+    # and tell QEMU whether to forward CS toggles (only devices that watch
+    # them need them). The tab's own half of the table comes with the config
+    # rather than in a command afterwards, and it is applied BEFORE the boot is
+    # announced: the guest can clock its first byte the moment anything thinks
+    # the board is up (project board-buses-2026-09, F4).
+    _apply_spi_bus_map((cfg.get('bus_map') or {}).get('spi') or [])
+    # And which I2C controller each target the tab placed is on (F5).
+    _i2c_table.apply_map((cfg.get('bus_map') or {}).get('i2c'))
+    # And which UART each endpoint's legs are wired to (F6).
+    _uart_table.apply_map((cfg.get('bus_map') or {}).get('uart'))
+    # And the module pulls, so a pad the guest reads before it ever drives it
+    # (a released line from reset) already reads its resistor.
+    _apply_pull_map((cfg.get('bus_map') or {}).get('pulls'))
     _emit({'type': 'system', 'event': 'booted'})
-    # Now that the initial components are registered, tell QEMU whether to
-    # forward SPI CS toggles (only ePaper/custom-chip need them).
-    _sync_cs_events()
     _log(f'QEMU started: machine={machine} firmware={firmware_path}')
     _log(f'QEMU args: {[a.decode() for a in args_list]}')
 
@@ -2346,6 +3171,20 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
     # Wakes on each chip's next_timer_deadline. Acquires the QEMU IO-thread lock
     # before firing callbacks because vx_pin_write inside a timer would touch
     # picsimlab_set_pin which requires the lock.
+    def _chip_now_ns() -> int:
+        """The timeline the chips' deadlines are on: the guest's clock when
+        libqemu exposes it (what the runtimes were given), host time since
+        the worker started otherwise."""
+        if _guest_clock_ns is not None:
+            return _guest_clock_ns()
+        return time.monotonic_ns() - _t0_ref[0]
+
+    # The guest clock does not run at the host's pace (it stops while the VM
+    # is paused, and -icount runs it slower or faster): a wait is a bounded
+    # nap, re-checked against the guest, so a deadline is never overshot by
+    # more than this and never fired early (fire_due_timers reads the clock).
+    _CHIP_TIMER_NAP_MAX_S = 0.020
+
     def _chip_timer_thread() -> None:
         while not _stopped.is_set():
             # Find the soonest deadline across all chips with active timers.
@@ -2358,17 +3197,31 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                 # No active timers — sleep a bit and re-check.
                 _stopped.wait(0.050)
                 continue
-            now_ns = time.monotonic_ns() - _t0_ref[0]
+            now_ns = _chip_now_ns()
             wait_ns = max(0, soonest_ns - now_ns)
             if wait_ns > 0:
-                _stopped.wait(wait_ns / 1e9)
+                _stopped.wait(min(wait_ns / 1e9, _CHIP_TIMER_NAP_MAX_S))
                 if _stopped.is_set():
                     break
+                if _chip_now_ns() < soonest_ns:
+                    continue
+            # Only what is due now fires, and with nothing due the lock is
+            # not taken: a deadline can move while the thread naps (an INT
+            # pad the bus already moved, a pulse the thread woke too late
+            # for), and every take stalls the vCPU.
+            now_ns = _chip_now_ns()
+            due = []
+            for rt in list(_chip_timer_runtimes):
+                d = rt.next_timer_deadline()
+                if d is not None and d <= now_ns:
+                    due.append(rt)
+            if not due:
+                continue
             # Fire under the IO-thread lock so any pin_write the timer triggers is safe.
             if _lock_iothread:
                 _lock_iothread(b'esp32_worker.py:chip_timer', 0)
             try:
-                for rt in list(_chip_timer_runtimes):
+                for rt in due:
                     try:
                         rt.fire_due_timers()
                     except Exception as e:
@@ -2446,6 +3299,9 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                     _lock_iothread(b'esp32_worker.py:set_pin', 0)
                 try:
                     lib.qemu_picsimlab_set_pin(int(cmd['pin']) + 1, int(cmd['value']))
+                    # A strong drive: it beats a module pull until the guest
+                    # takes the pad as an output.
+                    _pads.inject(int(cmd['pin']), int(cmd['value']))
                 finally:
                     if _unlock_iothread:
                         _unlock_iothread()
@@ -2541,14 +3397,39 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
         elif c == 'set_i2c_response':
             _i2c_responses[int(cmd['addr'])] = int(cmd['response']) & 0xFF
 
-        elif c == 'set_spi_response':
-            _spi_response[0] = int(cmd['response']) & 0xFF
+        elif c == 'bus_map':
+            # The tab's view of who is on this board's SPI bus and what each
+            # one's chip select is, with the portable model of every responder
+            # it wants hosted here (project board-buses-2026-09, F4). It
+            # replaced set_spi_response, which answered a byte the guest had
+            # already clocked.
+            # A map that carries only the I2C half (F5: an I2C membership
+            # change) leaves the SPI table, models and all, as it is.
+            if 'spi' in cmd:
+                _apply_spi_bus_map(cmd.get('spi') or [])
+            # Same transport for I2C (F5): which controller each target the
+            # fabric placed is on. A map with no `i2c` key leaves it as it was.
+            _i2c_table.apply_map(cmd.get('i2c'))
+            # And for UART (F6): the controllers each endpoint's legs reach,
+            # or that it reaches none. No `uart` key leaves it as it was.
+            _uart_table.apply_map(cmd.get('uart'))
+            # And the module pulls on the board pins. No `pulls` key leaves
+            # them as they were.
+            if 'pulls' in cmd:
+                _apply_pull_map(cmd.get('pulls') or [])
+
+        elif c == 'bus_attrs':
+            # Live inputs of one responder the map put here, between two maps.
+            _apply_spi_bus_attrs(str(cmd.get('owner') or ''), cmd.get('attrs'))
 
         elif c == 'sensor_attach':
             gpio = int(cmd['pin'])
             sensor_type = cmd.get('sensor_type', '')
             refuse_unmodelled_line_sensor(cmd)
             with _sensors_lock:
+                # The record replaces whatever was on this pin; an I2C target
+                # it registered goes with it, whatever the new one is.
+                _i2c_table.remove(('sensor', gpio))
                 sensor_data: dict = {
                     'type': sensor_type,
                     **{k: v for k, v in cmd.items()
@@ -2569,110 +3450,35 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                     except Exception:
                         pass
                 elif sensor_type == 'mpu6050':
-                    i2c_addr = int(cmd.get('addr', 0x68))
-                    slave = _MPU6050Slave(i2c_addr)
-                    _i2c_slaves[i2c_addr] = slave
+                    i2c_addr = _MPU6050Slave.address_of(cmd)
+                    slave = _mpu6050_slave(cmd, now_ns=_guest_clock_ns)
+                    _i2c_add(gpio, cmd, slave, i2c_addr)
+                    _mpu_int_attach(sensor_data, slave, cmd)
                     sensor_data['i2c_addr'] = i2c_addr
                     sensor_data['slave'] = slave
                 elif sensor_type == 'bmp280':
                     i2c_addr = int(cmd.get('addr', 0x76))
-                    slave = _BMP280Slave(i2c_addr)
-                    _i2c_slaves[i2c_addr] = slave
+                    # A part attached while the board runs starts from its
+                    # record too. It started from the twin's own values and
+                    # took the panel's at the first slider move.
+                    slave = _bmp280_slave(cmd)
+                    _i2c_add(gpio, cmd, slave, i2c_addr)
                     sensor_data['i2c_addr'] = i2c_addr
                     sensor_data['slave'] = slave
                 elif sensor_type in ('ds1307', 'ds3231'):
                     i2c_addr = int(cmd.get('addr', 0x68))
-                    slave = _DS3231Slave() if sensor_type == 'ds3231' else _DS1307Slave()
-                    _i2c_slaves[i2c_addr] = slave
+                    slave = _rtc_slave(sensor_type, cmd, _firmware_build_times)
+                    _i2c_add(gpio, cmd, slave, i2c_addr)
                     sensor_data['i2c_addr'] = i2c_addr
                     sensor_data['slave'] = slave
                 elif sensor_type == 'custom-chip':
                     _attach_custom_chip_sensor(gpio, cmd, sensor_data)
                 elif sensor_type in ('ssd1306', 'pcf8574', 'i2c-write-sink'):
-                    default_addr = 0x3C if sensor_type == 'ssd1306' else 0x27
-                    i2c_addr = int(cmd.get('addr', default_addr))
-                    sink = _I2CWriteSink(i2c_addr, _emit)
-                    _i2c_slaves[i2c_addr] = sink
+                    sink = _I2CWriteSink.from_record(sensor_type, cmd, _emit)
+                    i2c_addr = sink.addr
+                    _i2c_add(gpio, cmd, sink, i2c_addr)
                     sensor_data['i2c_addr'] = i2c_addr
                     sensor_data['slave'] = sink
-                elif sensor_type == 'epaper-ssd168x':
-                    # Runtime registration of an SSD168x ePaper panel. Mirrors
-                    # the `_init_sensors` branch above. Component-id keyed so
-                    # multiple panels on the same board route correctly.
-                    comp_id = str(cmd.get('component_id', f'epaper-{gpio}'))
-                    width = int(cmd.get('width', 200))
-                    height = int(cmd.get('height', 200))
-                    refresh_ms = int(cmd.get('refresh_ms', 50))
-                    busy_pin = int(cmd.get('busy_pin', -1))
-
-                    def _flush_factory_rt(_comp_id=comp_id,
-                                          _w=width, _h=height,
-                                          _refresh=refresh_ms,
-                                          _busy=busy_pin,
-                                          _lib=lib):
-                        def _on_flush(frame):
-                            try:
-                                frame_b64 = base64.b64encode(frame.pixels).decode('ascii')
-                            except Exception:
-                                return
-                            # Emit FLAT (see the _init_sensors path) — the backend
-                            # re-wraps under 'data', so a nested 'data' here would
-                            # double-wrap and the frontend would never render.
-                            _emit({
-                                'type': 'epaper_update',
-                                'component_id': _comp_id,
-                                'width': _w,
-                                'height': _h,
-                                'frame_b64': frame_b64,
-                                'refresh_ms': _refresh,
-                            })
-                            if _busy is not None and _busy >= 0:
-                                try:
-                                    _lib.qemu_picsimlab_set_pin(_busy + 1, 1)
-
-                                    def _busy_low(_b=_busy):
-                                        try:
-                                            _lib.qemu_picsimlab_set_pin(_b + 1, 0)
-                                        except Exception:
-                                            pass
-
-                                    threading.Timer(_refresh / 1000.0, _busy_low).start()
-                                except Exception:
-                                    pass
-                        return _on_flush
-
-                    ctl_family = str(cmd.get('controller_family', 'ssd168x'))
-                    if ctl_family == 'uc8159c':
-                        slave = _Uc8159cEpaperSlave(
-                            component_id=comp_id, width=width, height=height,
-                            on_flush=_flush_factory_rt(),
-                        )
-                    elif ctl_family == 'uc8179':
-                        slave = _Uc8179EpaperSlave(
-                            component_id=comp_id, width=width, height=height,
-                            on_flush=_flush_factory_rt(),
-                        )
-                    else:
-                        _is_bwr = 'bwr' in str(cmd.get('panel_kind', '')).lower()
-                        slave = _Ssd168xEpaperSlave(
-                            component_id=comp_id, width=width, height=height,
-                            on_flush=_flush_factory_rt(), is_bwr=_is_bwr,
-                        )
-                    state = {
-                        'slave': slave,
-                        'dc_pin': int(cmd.get('dc_pin', -1)),
-                        'cs_pin': int(cmd.get('cs_pin', -1)),
-                        'rst_pin': int(cmd.get('rst_pin', -1)),
-                        'busy_pin': busy_pin,
-                        'cs_low': False,
-                        'dc_high': False,
-                        'refresh_ms': refresh_ms,
-                        'controller_family': ctl_family,
-                    }
-                    _epaper_slaves[comp_id] = slave
-                    _epaper_state[comp_id] = state
-                    _sync_cs_events()
-                    sensor_data['epaper_component_id'] = comp_id
                 _sensors[gpio] = sensor_data
             _log(f'Sensor {sensor_type} attached on GPIO {gpio}')
 
@@ -2725,22 +3531,16 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                                 if _unlock_iothread:
                                     _unlock_iothread()
                     elif stype == 'mpu6050' and slave is not None:
-                        slave.update(
-                            accel_x=float(sensor.get('accelX', 0)),
-                            accel_y=float(sensor.get('accelY', 0)),
-                            accel_z=float(sensor.get('accelZ', 1)),
-                            gyro_x =float(sensor.get('gyroX',  0)),
-                            gyro_y =float(sensor.get('gyroY',  0)),
-                            gyro_z =float(sensor.get('gyroZ',  0)),
-                            temp   =float(sensor.get('temp',   25.0)),
-                        )
+                        # Only what this update names: a value it leaves out
+                        # stays where the record or an earlier update put it.
+                        slave.update(**cmd)
                     elif stype == 'bmp280' and slave is not None:
-                        slave.update(
-                            temperature_c =float(sensor.get('temperature', 25.0)),
-                            pressure_hpa  =float(sensor.get('pressure', 1013.25)),
-                        )
-                    elif stype == 'ds3231' and slave is not None:
-                        slave.temperatureC = float(sensor.get('temperature', 25.0))
+                        # Only what this update names, as above.
+                        slave.update(**cmd)
+                    elif stype in ('ds1307', 'ds3231') and slave is not None:
+                        # Only what this update names: the temperature the
+                        # slider moved to, or the tab's clock sent again.
+                        slave.update(**cmd)
                     elif stype == 'custom-chip':
                         # Live control values (chip.json `controls`) land on
                         # the chip runtime's attr store; the running WASM
@@ -2755,6 +3555,14 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                                 })
                             except Exception as e:
                                 _log(f'[custom-chip] attr update failed: {e!r}')
+                        # The solve moved a wired pad (or a wire came or went):
+                        # the tab sends the whole pad table again.
+                        new_volts = cmd.get('pad_volts')
+                        if rt is not None and isinstance(new_volts, dict):
+                            try:
+                                rt.update_pad_volts(new_volts)
+                            except Exception as e:
+                                _log(f'[custom-chip] pad_volts update failed: {e!r}')
 
             for _g, _p in _ir_pending:
                 with _sensors_lock:
@@ -2770,52 +3578,27 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                     _keypad_uninstall(sensor)
                 if sensor and sensor.get('type') == 'custom-chip':
                     _detach_custom_chip_sensor(sensor)
-                if sensor and 'i2c_addr' in sensor:
-                    _i2c_slaves.pop(sensor['i2c_addr'], None)
-                if sensor and 'epaper_component_id' in sensor:
-                    cid = sensor['epaper_component_id']
-                    _epaper_slaves.pop(cid, None)
-                    _epaper_state.pop(cid, None)
+                _int_drv = sensor.get('int_driver') if sensor else None
+                if _int_drv is not None:
+                    while _int_drv in _chip_timer_runtimes:
+                        _chip_timer_runtimes.remove(_int_drv)
+                    _int_drv.slave.on_int_change = None
+                # By identity, the record's pin: a second device at the same
+                # address (the same sensor on the other controller) stays.
+                _i2c_table.remove(('sensor', gpio))
+            # The pads a departed chip drove go back to the guest, another
+            # driver or their pull. Outside _sensors_lock: the QEMU thread
+            # takes that lock while it holds the IO-thread lock.
+            _owner = sensor.get('pad_owner') if sensor else None
+            if _owner is not None:
+                if _lock_iothread:
+                    _lock_iothread(b'esp32_worker.py:chip_gone', 0)
+                try:
+                    _pads.chip_gone(_owner)
+                finally:
+                    if _unlock_iothread:
+                        _unlock_iothread()
             _log(f'Sensor detached from GPIO {gpio}')
-
-        # ── Cross-board I2C proxy slave ──────────────────────────────────
-        # Installed by the frontend when an ESP32 board is wired across
-        # the I2C bus to a peer board (Uno, Pico, …) that owns a virtual
-        # device.  The frontend snapshots the device's register state and
-        # pushes it here; we install a ProxySlave at the address so the
-        # ESP32 firmware's Wire master reads succeed inside QEMU.
-        elif c == 'proxy_i2c_register':
-            i2c_addr = int(cmd.get('addr', 0)) & 0x7F
-            try:
-                regs = base64.b64decode(cmd.get('regs_b64', ''))
-            except Exception as exc:
-                _log(f'proxy_i2c_register: bad base64: {exc}')
-                regs = b''
-            # Pass _emit so writes from the ESP32 firmware get forwarded
-            # back to the frontend as `proxy_i2c_complete` events.  The
-            # frontend then replays the byte sequence on the actual
-            # peer I2CDevice so its state (PCF8574 latch, SSD1306
-            # GDDRAM, memory device registers …) stays in sync.
-            _i2c_slaves[i2c_addr] = _ProxySlave(i2c_addr, regs, emit_fn=_emit)
-            _log(f'proxy_i2c registered at 0x{i2c_addr:02x} ({len(regs)} bytes)')
-
-        elif c == 'proxy_i2c_update':
-            i2c_addr = int(cmd.get('addr', 0)) & 0x7F
-            try:
-                regs = base64.b64decode(cmd.get('regs_b64', ''))
-            except Exception as exc:
-                _log(f'proxy_i2c_update: bad base64: {exc}')
-                regs = b''
-            slave = _i2c_slaves.get(i2c_addr)
-            if slave is not None and hasattr(slave, 'update_registers'):
-                slave.update_registers(regs)
-                _log(f'proxy_i2c updated at 0x{i2c_addr:02x} ({len(regs)} bytes)')
-
-        elif c == 'proxy_i2c_unregister':
-            i2c_addr = int(cmd.get('addr', 0)) & 0x7F
-            popped = _i2c_slaves.pop(i2c_addr, None)
-            if popped is not None:
-                _log(f'proxy_i2c unregistered at 0x{i2c_addr:02x}')
 
         # ── ESP32-CAM frame injection ────────────────────────────────────
         # Pushes a JPEG (or other format) into the QEMU OV2640 device's

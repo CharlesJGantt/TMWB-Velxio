@@ -3,10 +3,15 @@ import {
   getEsp32Bridge,
   getBoardBridge,
   getBoardSimulator,
+  getBoardPinManager,
+  observeBoardWs2812,
 } from '../../store/useSimulatorStore';
+import { attachOnboardLeds, sameLedVisual } from '../../simulation/onboardLeds';
+import type { BoardLedVisuals } from '../../types/board';
 import { getBoardBuiltins, getProBoard } from '../../lib/proBoardRegistry';
 import { useElectricalStore } from '../../store/useElectricalStore';
 import { openDeviceGateway } from '../../lib/openDeviceGateway';
+import { remoteBoardActions } from '../../simulation/remoteBoardAutostart';
 import React, { useEffect, useState, useRef, useCallback, useSyncExternalStore } from 'react';
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
@@ -22,20 +27,21 @@ import { DynamicComponent, createComponentFromMetadata } from '../DynamicCompone
 import { InstrumentComponent } from '../components-instruments/InstrumentComponent';
 import { ComponentRegistry } from '../../services/ComponentRegistry';
 import { getTabSessionId } from '../../simulation/Esp32Bridge';
-import { CameraToggle } from './CameraToggle';
 import { ComponentCameraToggles } from './ComponentCameraToggles';
-import { MicrophoneToggle } from './MicrophoneToggle';
-import { BoardSensorControls } from './BoardSensorControls';
 import { WireLayer } from './WireLayer';
 import type { SegmentHandle, WaypointHandle, AlignmentGuide } from './WireLayer';
 import { ElectricalOverlay } from '../analog-ui/ElectricalOverlay';
 import { BoardOnCanvas } from './BoardOnCanvas';
+import { boardSize, normalizeRotation } from '../../utils/boardGeometry';
+import { BoardDock } from './BoardDock';
 import { PartSimulationRegistry } from '../../simulation/parts';
 import { PROPERTY_CHANGE_EVENT, type PropertyChangeDetail } from '../../simulation/parts/partUtils';
 import { mountDigitalGateEngine } from '../../simulation/digital/digitalGateController';
 import { isSpiceMapped } from '../../simulation/spice/componentToSpice';
 import { PinOverlay } from './PinOverlay';
 import { SeatedPinMarkers } from './SeatedPinMarkers';
+import { pinStateEchoHandler } from './pinStateEcho';
+import { PartErrorBoundary } from './PartErrorBoundary';
 import { calculatePinPosition } from '../../utils/pinPositionCalculator';
 import { isBoardComponent, boardPinToNumber } from '../../utils/boardPinMapping';
 import { isBreadboard } from '../../utils/breadboardNets';
@@ -275,6 +281,10 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
   // mutators for transient state during the interaction (drag preview).
   const recordAddComponent = useSimulatorStore((s) => s.recordAddComponent);
   const recordRemoveComponent = useSimulatorStore((s) => s.recordRemoveComponent);
+  const rotateBoard = useSimulatorStore((s) => s.rotateBoard);
+  const copyBoard = useSimulatorStore((s) => s.copyBoard);
+  const pasteClipboard = useSimulatorStore((s) => s.pasteClipboard);
+  const canvasClipboard = useSimulatorStore((s) => s.canvasClipboard);
   const recordMove = useSimulatorStore((s) => s.recordMove);
   const recordRotate = useSimulatorStore((s) => s.recordRotate);
   const recordSetProperty = useSimulatorStore((s) => s.recordSetProperty);
@@ -326,25 +336,27 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
   // element + the board's simulator/bridge handles shortly after run start
   // (the element and bridge need a beat to exist) and dispose on stop/unmount.
   //
-  // Keyed on a STABLE run signature, not the boards array identity: `boards`
-  // is replaced on every serial batch (~60 Hz while output flows), and
-  // re-running this effect then detaches/re-attaches the peripherals in a
-  // loop — any event arriving inside the 500 ms re-attach window is lost
-  // (one-shot streams like a display list never recover, unlike the
-  // continuously-repainting SPI LCD decoders that masked this).
-  const attachKey = boards
-    .map((b) => `${b.id}:${b.boardKind}:${b.running ? 1 : 0}`)
-    .join('|');
+  // A board's own peripherals (its LCD, its card slot, its e-paper) are
+  // soldered to it: they exist as long as the board is on the canvas, not as
+  // long as it is running. They register on the board's buses (project
+  // board-buses-2026-09) and the fabric hands them their reset when the MCU
+  // resets, so attaching them per Run is both wrong and lossy: the guest
+  // clocks its display init in the first milliseconds of a run, and a
+  // peripheral that attaches 500 ms later has already missed it. Keyed on the
+  // board identity only, so a serial batch (which replaces `boards` ~60 times a
+  // second) cannot tear them down either.
+  const attachKey = boards.map((b) => `${b.id}:${b.boardKind}`).join('|');
   useEffect(() => {
     const cleanups: (() => void)[] = [];
+    const pending: Array<ReturnType<typeof setInterval>> = [];
     useSimulatorStore
       .getState()
       .boards.forEach((board) => {
         const attachBuiltins = getBoardBuiltins(board.boardKind);
-        if (!attachBuiltins || !board.running) return;
-        const timeout = setTimeout(() => {
+        if (!attachBuiltins) return;
+        const attach = (): boolean => {
           const el = document.getElementById(board.id);
-          if (!el) return;
+          if (!el) return false;
           try {
             cleanups.push(
               attachBuiltins({
@@ -358,21 +370,51 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
           } catch (e) {
             console.warn(`[${board.boardKind}] built-in peripheral attach failed:`, e);
           }
-        }, 500);
-        cleanups.push(() => clearTimeout(timeout));
+          return true;
+        };
+        // The board element is a custom element the overlay may still be
+        // loading, so wait for it rather than guessing a delay.
+        if (attach()) return;
+        const interval = setInterval(() => {
+          if (attach()) clearInterval(interval);
+        }, 100);
+        pending.push(interval);
+        const timeout = setTimeout(() => clearInterval(interval), 10000);
+        cleanups.push(() => {
+          clearInterval(interval);
+          clearTimeout(timeout);
+        });
       });
-    return () => cleanups.forEach((fn) => fn());
+    return () => {
+      for (const i of pending) clearInterval(i);
+      cleanups.forEach((fn) => fn());
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [attachKey]);
 
   // Component selection
   const [selectedComponentId, setSelectedComponentId] = useState<string | null>(null);
+  // The board the user last clicked on the canvas — the target of the Delete /
+  // Ctrl+C / R keys. Distinct from activeBoardId, which is always set (it is
+  // whose code the editor shows) and so must never be what a key deletes.
+  // Selecting a component or a wire, or clicking empty canvas, clears it.
+  const [selectedBoardId, setSelectedBoardId] = useState<string | null>(null);
+  const selectBoard = (boardId: string) => {
+    setSelectedBoardId(boardId);
+    setSelectedComponentId(null);
+    useSimulatorStore.getState().setSelectedWire(null);
+  };
+  // A component or wire selection takes over from a selected board.
+  useEffect(() => {
+    if (selectedComponentId || selectedWireId) setSelectedBoardId(null);
+  }, [selectedComponentId, selectedWireId]);
 
   // Hover tracking — drives the conditional pin overlay so the canvas isn't
   // permanently covered in pin chips. Pins show for the hovered/selected
   // component or board, plus all elements while a wire is in progress.
   const [hoveredComponentId, setHoveredComponentId] = useState<string | null>(null);
   const [hoveredBoardId, setHoveredBoardId] = useState<string | null>(null);
+
 
   // Touch-friendly pin picker — shown when the user taps a component or board
   // body (not a tiny pin overlay) and we want to let them pick a pin from a
@@ -407,7 +449,7 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
 
   // Board built-in LED states (pin 13 for AVR, GPIO25 for RP2040, etc.)
   // Tracks directly from pinManager — independent of any led-builtin component.
-  const [boardLedStates, setBoardLedStates] = useState<Record<string, boolean>>({});
+  const [boardLedStates, setBoardLedStates] = useState<Record<string, BoardLedVisuals>>({});
 
   // Board context menu (right-click)
   const [boardContextMenu, setBoardContextMenu] = useState<{
@@ -503,6 +545,7 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
     if (interactionRunning) {
       setSelectedWire(null);
       setSelectedComponentId(null);
+      setSelectedBoardId(null);
     }
   }, [interactionRunning, setSelectedWire]);
 
@@ -648,10 +691,11 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
 
   // Runtime parts (pots, switches, sensor panels) emit
   // `velxio:property-change` instead of writing the store directly — one
-  // listener here routes every mutation through `updateComponent()`, which
-  // is the same path the Property Dialog uses. Keeps parts decoupled from
-  // Zustand and guarantees the SPICE netlist memo invalidates on every
-  // user-driven property change.
+  // listener here routes every mutation through `applyLivePropertyChange()`,
+  // which lands on `updateComponent()` like the Property Dialog does (so the
+  // SPICE netlist memo invalidates) and, for a sensor, keeps the project value
+  // the live one replaced so Reset can put it back. Keeps parts decoupled
+  // from Zustand.
   useEffect(() => {
     const onPropertyChange = (evt: Event) => {
       const { componentId, propName, value } = (evt as CustomEvent<PropertyChangeDetail>).detail;
@@ -659,9 +703,7 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
       const comp = state.components.find((c) => c.id === componentId);
       if (!comp) return;
       if (String(comp.properties?.[propName]) === String(value)) return;
-      state.updateComponent(componentId, {
-        properties: { ...comp.properties, [propName]: value },
-      });
+      state.applyLivePropertyChange(componentId, propName, value);
     };
     window.addEventListener(PROPERTY_CHANGE_EVENT, onPropertyChange);
     return () => window.removeEventListener(PROPERTY_CHANGE_EVENT, onPropertyChange);
@@ -673,9 +715,12 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
   // No-op when the flag is off (default).
   useEffect(() => mountDigitalGateEngine(), []);
 
-  // Auto-start/stop Pi bridges when simulation state changes
+  // Auto-start/stop Pi bridges when simulation state changes: each remote
+  // board starts once per session, so a script that finished is not re-run
+  // (see remoteBoardAutostart.ts for the restart loop this prevents).
   const startBoard = useSimulatorStore((s) => s.startBoard);
   const stopBoard = useSimulatorStore((s) => s.stopBoard);
+  const autoStartedRef = useRef<Set<string>>(new Set());
   useEffect(() => {
     const remoteBoards = boards.filter(
       (b) =>
@@ -686,10 +731,9 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
         b.boardKind === 'esp32-s3' ||
         b.boardKind === 'esp32-c3',
     );
-    remoteBoards.forEach((b) => {
-      if (running && !b.running) startBoard(b.id);
-      else if (!running && b.running) stopBoard(b.id);
-    });
+    const { start, stop } = remoteBoardActions(running, remoteBoards, autoStartedRef.current);
+    start.forEach((id) => startBoard(id));
+    stop.forEach((id) => stopBoard(id));
   }, [running, boards, startBoard, stopBoard]);
 
   // Attach wheel listener as non-passive so preventDefault() works
@@ -758,6 +802,10 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
 
       // Identify what element was touched
       const target = document.elementFromPoint(touch.clientX, touch.clientY);
+
+      // A board dock button (camera, SD, settings...) is a plain button: let
+      // the tap reach it instead of starting a pan / drag under it.
+      if (target?.closest('[data-board-dock]')) return;
 
       // ── 1. Pin overlay → let pin's onTouchEnd React handler call handlePinClick ──
       if (target?.closest('[data-pin-overlay]')) {
@@ -1184,6 +1232,7 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
             // a tiny pin overlay with a finger.
             const boardId = touchId.slice('__board__:'.length);
             const state = useSimulatorStore.getState();
+            selectBoard(boardId);
             if (state.activeBoardId === boardId) {
               setPinPicker({ kind: 'board', targetId: boardId });
             } else {
@@ -1297,6 +1346,7 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
         } else {
           useSimulatorStore.getState().setSelectedWire(null);
           setSelectedComponentId(null);
+          setSelectedBoardId(null);
         }
       }
     };
@@ -1360,37 +1410,30 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
       // ~2 ms under PWM (490 Hz) and the solver would effectively never run — the
       // root cause of the MOSFET-PWM-LED regression. This single rule makes every
       // current and future SPICE mapper immune to that feedback loop.
-      const logic = PartSimulationRegistry.get(component.metadataId);
-      const spiceOwned = isSpiceMapped(component.metadataId);
+      //
       // Breadboards have no visual on/off state, but they ARE direct-wired to
       // many board pins (one wire per strip → GPIO). Writing properties.state
       // per edge minted a new components array thousands of times per second
       // on multiplexed sketches — pure churn that re-rendered the whole
       // editor. Treat them as self-managed: skip the generic state echo.
-      const hasSelfManagedVisuals =
-        !!(logic && logic.attachEvents) || spiceOwned || isBreadboard(component.metadataId);
-
-      // Generic GND check: for wire-connected output components that don't manage
-      // their own state, require at least one GND wire before activating.
-      // Skip the check for pin-property components (no GND wire to detect) and for
-      // self-managed components (they handle GND themselves via attachEvents).
-      const hasGnd =
-        !wireConnected || hasSelfManagedVisuals ? true : componentHasGndWire(component);
-
-      const unsubscribe = pinManager.onPinChange(pin, (_pin, state) => {
-        if (!hasSelfManagedVisuals) {
-          // Update React state — gate on GND for wire-connected components.
-          updateComponentState(component.id, hasGnd && state);
-        }
-
-        // Delegate to PartSimulationRegistry for custom visual updates
-        if (logic && logic.onPinStateChange) {
-          const el = document.getElementById(component.id);
-          if (el) {
-            logic.onPinStateChange(componentPinName || 'A', hasGnd && state, el);
-          }
-        }
-      });
+      //
+      // Which kind a part is gets decided per change, and a part the app does
+      // not know yet is never echoed (an overlay part whose logic lands after
+      // this effect ran): see pinStateEcho.ts.
+      const unsubscribe = pinManager.onPinChange(
+        pin,
+        pinStateEchoHandler({
+          componentId: component.id,
+          metadataId: component.metadataId,
+          componentPinName,
+          wireConnected,
+          hasGndWire: () => componentHasGndWire(component),
+          isKnownPart: (metadataId) => !!registry.getById(metadataId),
+          ownsVisualsAnyway: (metadataId) => isSpiceMapped(metadataId) || isBreadboard(metadataId),
+          getLogic: (metadataId) => PartSimulationRegistry.get(metadataId),
+          updateComponentState,
+        }),
+      );
       unsubscribers.push(unsubscribe);
     };
 
@@ -1436,42 +1479,63 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
     return () => {
       unsubscribers.forEach((unsub) => unsub());
     };
-  }, [components, wires, boards, pinManager, updateComponentState]);
+  }, [components, wires, boards, pinManager, updateComponentState, registry]);
 
-  // Board built-in LED: subscribe directly to pinManager for the LED pin of each board.
-  // This works even when no external led-builtin component exists (e.g. basic Blink example).
+  // Board built-in LEDs: each board's declared LEDs (BOARD_ONBOARD_LEDS, pin
+  // and polarity per kind) follow that board's own pads and WS2812 frames.
+  // This works even when no external led-builtin component exists (e.g. basic
+  // Blink example). It used to watch pin 13 for every kind it had no case for,
+  // which is why no ESP32 ever lit (issue #374), and it watched it on the
+  // flat store PinManager, which is the ACTIVE board's: a second board's LED
+  // mirrored the first board's pin.
   useEffect(() => {
     if (!pinManager) return;
     const unsubs: (() => void)[] = [];
 
     boards.forEach((board) => {
-      // Determine which GPIO pin drives the board's built-in LED
-      let ledPin: number;
-      switch (board.boardKind) {
-        case 'raspberry-pi-pico':
-        case 'pi-pico-w':
-        case 'nano-rp2040':
-          ledPin = 25; // GPIO25
-          break;
-        case 'attiny85':
-          ledPin = 1; // PB1 (Digispark convention)
-          break;
-        default:
-          ledPin = 13; // Pin 13 for Arduino Uno/Nano/Mega
-      }
-
+      const pm = getBoardPinManager(board.id) ?? pinManager;
       unsubs.push(
-        pinManager.onPinChange(ledPin, (_pin, state) => {
-          setBoardLedStates((prev) => {
-            if (prev[board.id] === state) return prev;
-            return { ...prev, [board.id]: state };
-          });
-        }),
+        attachOnboardLeds(
+          board.boardKind,
+          {
+            onPinChange: (pin, cb) => pm.onPinChange(pin, cb),
+            getPinState: (pin) => pm.getPinState(pin),
+            getOutputPins: () => pm.getOutputPins(),
+            onPinConfigChange: (pin, cb) => pm.onPinConfigChange(pin, cb),
+            observeWs2812: (pin, sink) =>
+              observeBoardWs2812(board.id, (framePin, pixels) => {
+                if (framePin === pin) sink(pixels);
+              }),
+          },
+          (ledId, visual) => {
+            setBoardLedStates((prev) => {
+              if (sameLedVisual(prev[board.id]?.[ledId], visual)) return prev;
+              return { ...prev, [board.id]: { ...prev[board.id], [ledId]: visual } };
+            });
+          },
+        ),
       );
     });
 
     return () => unsubs.forEach((u) => u());
   }, [boards, pinManager]);
+
+  // Stop is a power cut, and an LED with no power is dark whatever its pad
+  // was left at. The hard reset stopBoard runs reports every pad that was
+  // HIGH as LOW, which an active-LOW LED would read as "lit", and a pad left
+  // LOW reports nothing at all; the render below also hides a stopped
+  // board's LEDs, so neither shows for the frame between the two.
+  useEffect(() => {
+    setBoardLedStates((prev) => {
+      let next: Record<string, BoardLedVisuals> | null = null;
+      for (const board of boards) {
+        if (board.running || !prev[board.id]) continue;
+        next ??= { ...prev };
+        delete next[board.id];
+      }
+      return next ?? prev;
+    });
+  }, [boards]);
 
   // ESP32 input components: forward button presses and potentiometer values to QEMU
   useEffect(() => {
@@ -1575,25 +1639,72 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
           return;
         }
       }
+      // Canvas edit keys act on what was explicitly selected: the selected
+      // component, else the selected board (selectedBoardId — a board the user
+      // clicked, never merely the active one). R turns it, Ctrl+C copies it,
+      // Ctrl+V pastes the last copy (with the pointer over the canvas, so a
+      // paste meant for another panel never drops a part), Delete removes it.
+      const sim = useSimulatorStore.getState();
+      const boardId = selectedBoardId && sim.boards.some((b) => b.id === selectedBoardId)
+        ? selectedBoardId
+        : null;
+      const editable = !interactionRunningRef.current;
+      const mod = e.ctrlKey || e.metaKey;
+      if (!editable) return;
+      if (!mod && !e.altKey && (e.key === 'r' || e.key === 'R')) {
+        if (selectedComponentId) {
+          handleRotateComponent(selectedComponentId);
+          e.preventDefault();
+        } else if (boardId) {
+          sim.rotateBoard(boardId);
+          e.preventDefault();
+        }
+        return;
+      }
+      if (mod && e.key.toLowerCase() === 'c') {
+        // Never steal a text copy (serial output, a label the user selected).
+        if ((window.getSelection()?.toString() ?? '') !== '') return;
+        if (selectedComponentId) {
+          sim.copyComponent(selectedComponentId);
+          e.preventDefault();
+        } else if (boardId) {
+          sim.copyBoard(boardId);
+          e.preventDefault();
+        }
+        return;
+      }
+      if (mod && e.key.toLowerCase() === 'v') {
+        const overCanvas = canvasRef.current?.matches(':hover') ?? false;
+        if (!sim.canvasClipboard || !overCanvas) return;
+        const pasted = sim.pasteClipboard(boardId ?? undefined);
+        if (pasted?.kind === 'component') setSelectedComponentId(pasted.id);
+        else if (pasted?.kind === 'board') selectBoard(pasted.id);
+        e.preventDefault();
+        return;
+      }
+      if ((e.key === 'Delete' || e.key === 'Backspace') && !selectedComponentId && boardId) {
+        // Same confirmation the dock / inspector remove goes through.
+        setBoardToRemove(boardId);
+        e.preventDefault();
+        return;
+      }
       if (e.key === 'Delete' || e.key === 'Backspace') {
         if (selectedComponentId) {
           // Recorded so the user can Ctrl+Z this back. Cascades wire removal too.
           recordRemoveComponent(selectedComponentId);
           setSelectedComponentId(null);
         }
-        // The board is intentionally NOT deletable via Delete/Backspace. It is
-        // always the "active" board (its code is shown in the editor), so keying
-        // off activeBoardId here popped the board-removal confirmation whenever
-        // the user pressed Delete to remove a wire, or after they had just
-        // deleted a component. Board removal stays on the explicit, deliberate
-        // paths: the right-click "Remove board" context menu and the touch
-        // pin-picker delete action.
+        // A board is deletable from the keyboard only through selectedBoardId
+        // (handled above), never through activeBoardId: the active board is
+        // always set, and keying off it popped the board-removal confirmation
+        // whenever the user pressed Delete to remove a wire or a component.
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedComponentId, recordRemoveComponent]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedComponentId, selectedBoardId, recordRemoveComponent]);
 
   // Where the next thing added from the picker lands — components AND boards
   // share this, so both start at the same corner and cascade over the same
@@ -2017,6 +2128,7 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
           // Click on a board — make it the active board (editor switches to its code)
           const boardId = draggedComponentId.slice('__board__:'.length);
           useSimulatorStore.getState().setActiveBoardId(boardId);
+          selectBoard(boardId);
         } else if (draggedComponentId !== '__board__') {
           const component = components.find((c) => c.id === draggedComponentId);
           if (component) {
@@ -2131,6 +2243,9 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
     const leftButton = e.button === 0;
     const middleOrRight = e.button === 1 || e.button === 2;
     const isPanGesture = middleOrRight || (leftButton && !wireInProgress && !showPropertyDialog);
+    // A left press on the background (boards, their docks and components stop
+    // propagation) drops the board selection, so Delete no longer targets it.
+    if (leftButton && !wireInProgress) setSelectedBoardId(null);
 
     if (isPanGesture) {
       e.preventDefault();
@@ -2691,58 +2806,72 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
             pointerEvents: 'auto',
           }}
         >
-          <DynamicComponent
-            id={component.id}
-            metadata={metadata}
-            properties={component.properties}
+          <PartErrorBoundary
+            partId={component.id}
+            label={metadata.name || component.metadataId}
             x={component.x}
             y={component.y}
-            isSelected={isSelected}
-            isHovered={isHovered}
-            onMouseDown={(e) => {
-              handleComponentMouseDown(component.id, e);
-            }}
+            resetKey={component.properties}
+            onMouseDown={(e) => handleComponentMouseDown(component.id, e)}
             onContextMenu={(e) => {
-              // Right click is where properties and pins live now. Selecting
-              // first means the ants mark what the dialog is about to edit.
-              // While the simulation runs the inspector still opens (boards
-              // always did), read-only: no rotate/delete/wiring, but the
-              // datasheet, the pin roles and the SD card's live contents are
-              // exactly what a running circuit makes you want to look at.
               e.preventDefault();
               e.stopPropagation();
               openComponentInspector(component.id, { x: e.clientX, y: e.clientY });
             }}
-            onOpenInspector={(e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              openComponentInspector(component.id, { x: e.clientX, y: e.clientY });
-            }}
-          />
+          >
+            <DynamicComponent
+              id={component.id}
+              metadata={metadata}
+              properties={component.properties}
+              x={component.x}
+              y={component.y}
+              isSelected={isSelected}
+              isHovered={isHovered}
+              onMouseDown={(e) => {
+                handleComponentMouseDown(component.id, e);
+              }}
+              onContextMenu={(e) => {
+                // Right click is where properties and pins live now. Selecting
+                // first means the ants mark what the dialog is about to edit.
+                // While the simulation runs the inspector still opens (boards
+                // always did), read-only: no rotate/delete/wiring, but the
+                // datasheet, the pin roles and the SD card's live contents are
+                // exactly what a running circuit makes you want to look at.
+                e.preventDefault();
+                e.stopPropagation();
+                openComponentInspector(component.id, { x: e.clientX, y: e.clientY });
+              }}
+              onOpenInspector={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                openComponentInspector(component.id, { x: e.clientX, y: e.clientY });
+              }}
+            />
 
-          {/* Green dots on pins plugged into a breadboard — always visible so
-              "seated & connected" is legible without hovering. */}
-          <SeatedPinMarkers
-            componentId={component.id}
-            componentX={component.x}
-            componentY={component.y}
-            seatedPins={seatedPinsByComponent.get(component.id) ?? []}
-            rotation={Number(component.properties?.rotation) || 0}
-          />
-
-          {/* Pin overlay for wire creation - hide while interacting/running */}
-          {!interactionRunning && (
-            <PinOverlay
+            {/* Green dots on pins plugged into a breadboard — always visible so
+                "seated & connected" is legible without hovering. */}
+            <SeatedPinMarkers
               componentId={component.id}
               componentX={component.x}
               componentY={component.y}
-              onPinClick={handlePinClick}
-              showPins={showPinsForComponent}
-              zoom={zoom}
+              seatedPins={seatedPinsByComponent.get(component.id) ?? []}
               rotation={Number(component.properties?.rotation) || 0}
-              wiring={wireInProgress}
             />
-          )}
+
+            {/* Pin overlay for wire creation - hide while interacting/running */}
+            {!interactionRunning && (
+              <PinOverlay
+                componentId={component.id}
+                componentX={component.x}
+                componentY={component.y}
+                onPinClick={handlePinClick}
+                showPins={showPinsForComponent}
+                zoom={zoom}
+                rotation={Number(component.properties?.rotation) || 0}
+                wiring={wireInProgress}
+              />
+            )}
+          </PartErrorBoundary>
         </div>
       </React.Fragment>
     );
@@ -2862,62 +2991,15 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
                   {t('editor.canvas.serial')}
                 </button>
 
-                {/* Webcam stream toggle, for boards with a camera: the
-                    ESP32-CAM (OV2640 over I2S0 DVP) and the XIAO ESP32S3
-                    Sense (OV2640-compatible over LCD_CAM). */}
-                {(activeBoard?.boardKind === 'esp32-cam' ||
-                  activeBoard?.boardKind === 'xiao-esp32s3-sense' ||
-                  (activeBoard &&
-                    Boolean(getProBoard(activeBoard.boardKind)?.builtInCamera))) && (
-                  <CameraToggle
-                    boardId={activeBoard.id}
-                    // The S3 esp32-camera build allocates width*height/5 bytes
-                    // for a QVGA JPEG frame (15360) and stops copying at
-                    // fb_size - one 1 KiB DMA half-buffer: frames must stay
-                    // under ~14336 or the EOI marker is truncated (NO-EOI).
-                    // Overlay boards declare their cap on builtInCamera.
-                    maxFrameBytes={
-                      activeBoard.boardKind === 'xiao-esp32s3-sense'
-                        ? 14000
-                        : ((cam) => (typeof cam === 'object' ? cam.maxFrameBytes : undefined))(
-                            getProBoard(activeBoard.boardKind)?.builtInCamera,
-                          )
-                    }
-                  />
-                )}
-
                 {/* Header toggles for COMPONENT-owned webcams (vision sensors
                     that capture the webcam themselves — see
                     componentCameraRegistry). Renders nothing when none. */}
                 <ComponentCameraToggles />
 
-                {/* Microphone stream toggle, for boards whose def declares an
-                    on-board mic (their bridge implements setMicrophoneSource).
-                    Off = the bridge's 440 Hz test tone keeps mic sketches
-                    alive, so no auto-start: taking the user's microphone is
-                    an explicit click. */}
-                {activeBoard &&
-                  getProBoard(activeBoard.boardKind)?.builtInMicrophone === true && (
-                    <MicrophoneToggle boardId={activeBoard.id} />
-                  )}
-
-                {/* Tilt pad + battery slider, for boards whose def declares an
-                    IMU or a battery gauge. Purely simulation inputs: the
-                    emulated parts are faithful but static without them (an
-                    untouched IMU reports the board flat on a table forever). */}
-                {activeBoard &&
-                  (() => {
-                    const def = getProBoard(activeBoard.boardKind);
-                    const imu = def?.builtInImu === true;
-                    const battery = def?.builtInBattery === true;
-                    return imu || battery ? (
-                      <BoardSensorControls
-                        boardId={activeBoard.id}
-                        showImu={imu}
-                        showBattery={battery}
-                      />
-                    ) : null;
-                  })()}
+                {/* Board camera / microphone / tilt + battery controls live on
+                    each board's own dock (BoardDock), not here: in the header
+                    they drove the ACTIVE board only, which is ambiguous with
+                    more than one board on the canvas. */}
 
                 {/* Overlay slot for the WiFi/network panel (local gateway
                     pairing on velxio.dev). Empty in the OSS build. */}
@@ -3251,6 +3333,8 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
             } else {
               setSelectedWire(null);
               setSelectedComponentId(null);
+              // (The board selection is dropped on the background mousedown:
+              // a click on a board bubbles here too and must keep it.)
             }
           }}
           onDoubleClick={(e) => {
@@ -3287,7 +3371,7 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
               different instance of the same sensor type (e.g. a second photoresistor); the
               slider state is local and would otherwise show the previously-clicked sensor's
               value until the user manually moved it. The sensorResetNonce suffix also remounts
-              it on Reset, so the slider snaps back to the sensor's default value. */}
+              it on Reset, so the slider snaps back to the sensor's project value. */}
           {sensorControlComponentId &&
             sensorControlMetadataId &&
             (() => {
@@ -3360,7 +3444,7 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
                   isActive={isActive}
                   showPins={showPins}
                   wiring={wireInProgress}
-                  led13={Boolean(boardLedStates[board.id])}
+                  onboardLeds={board.running ? boardLedStates[board.id] : undefined}
                   onMouseEnter={() => setHoveredBoardId(board.id)}
                   onMouseLeave={() =>
                     setHoveredBoardId((curr) => (curr === board.id ? null : curr))
@@ -3386,6 +3470,35 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
             {/* Components using wokwi-elements */}
             <div className="components-area">
               {registryLoaded && components.map(renderComponent)}
+            </div>
+
+            {/* Per-board control rows (BoardDock): above components and wires
+                so nothing placed under a board can cover them. Edit actions
+                belong to the selected (active) board only: tied to hover they
+                vanished the moment the pointer left the board for them. */}
+            <div className="board-docks-layer">
+              {boards.map((board) => (
+                <BoardDock
+                  key={board.id}
+                  board={board}
+                  zoom={zoom}
+                  running={interactionRunning}
+                  showEdit={!wireInProgress && board.id === activeBoardId}
+                  onOpenInspector={(x, y) => setBoardContextMenu({ boardId: board.id, x, y })}
+                  onRotate={() => rotateBoard(board.id)}
+                  onCopy={() => copyBoard(board.id)}
+                  onPaste={
+                    canvasClipboard
+                      ? () => {
+                          const pasted = pasteClipboard(board.id);
+                          if (pasted?.kind === 'component') setSelectedComponentId(pasted.id);
+                          else if (pasted?.kind === 'board') selectBoard(pasted.id);
+                        }
+                      : undefined
+                  }
+                  onRemove={() => setBoardToRemove(board.id)}
+                />
+              ))}
             </div>
 
             {/* Electrical simulation overlay (voltages / warnings).
@@ -3591,7 +3704,14 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
                 let worldY: number;
                 if (pinPicker.kind === 'board') {
                   const b = boards.find((x) => x.id === targetId);
-                  const pos = calculatePinPosition(targetId, pinName, b?.x ?? 0, b?.y ?? 0, 0);
+                  const pos = calculatePinPosition(
+                    targetId,
+                    pinName,
+                    b?.x ?? 0,
+                    b?.y ?? 0,
+                    normalizeRotation(b?.rotation),
+                    b ? boardSize(b.boardKind) : undefined,
+                  );
                   worldX = pos?.x ?? (b?.x ?? 0) + pin.x;
                   worldY = pos?.y ?? (b?.y ?? 0) + pin.y;
                 } else {
@@ -3702,10 +3822,9 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
           );
         })()}
 
-      {/* Board inspector — the same dialog components use. Boards do not
-          rotate, so the actions column carries Board Options / Flash and a
-          "Remove board" delete instead. It replaces the small context menu
-          that used to live here. */}
+      {/* Board inspector — the same dialog components use: Rotate, Board
+          Options / Flash and a "Remove board" delete in the actions column.
+          It replaces the small context menu that used to live here. */}
       {boardContextMenu &&
         (() => {
           const board = boards.find((b) => b.id === boardContextMenu.boardId);
@@ -3779,10 +3898,12 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
                   defaultValues: {},
                   pinCount: boardPins?.length ?? 0,
                   tags: [],
-                  // A board with a BUILT-IN microSD slot (XIAO Sense) gets the
-                  // same SD Card upload panel a component slot gets; the files
-                  // live on board.sdFiles and feed the card image on Run.
-                  sdSlot: getProBoard(board.boardKind)?.builtInSdCsPin !== undefined,
+                  // A board with a BUILT-IN microSD slot (a XIAO Sense on SPI,
+                  // a P4 on SDMMC) gets the same SD Card upload panel a
+                  // component slot gets; the files live on board.sdFiles and
+                  // feed the card image on Run. The BUS is the bridge's
+                  // problem, not the panel's.
+                  sdSlot: getProBoard(board.boardKind)?.builtInSd !== undefined,
                 } as unknown as ComponentMetadata
               }
               componentProperties={{ sdFiles: board.sdFiles }}
@@ -3791,6 +3912,7 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
               previewTagName={element?.tagName.toLowerCase()}
               previewAttributes={{ 'board-kind': board.boardKind }}
               extraActions={actions}
+              onRotate={interactionRunning ? undefined : (id) => rotateBoard(id)}
               deleteLabel={t('editor.canvas.removeBoard')}
               // The remove-board modal (boardToRemove) is the confirmation for
               // boards — it knows the wire count; a second ask here would stack.
@@ -3817,7 +3939,15 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
                 );
                 if (!b || !pin) return;
                 setBoardContextMenu(null);
-                handlePinClick(id, pinName, b.x + pin.x, b.y + pin.y);
+                const pos = calculatePinPosition(
+                  id,
+                  pinName,
+                  b.x,
+                  b.y,
+                  normalizeRotation(b.rotation),
+                  boardSize(b.boardKind),
+                );
+                handlePinClick(id, pinName, pos?.x ?? b.x + pin.x, pos?.y ?? b.y + pin.y);
               }}
             />
           );

@@ -168,6 +168,7 @@ export function buildLoadPayload(project: RawProject) {
         boardKind: b.boardKind as BoardKind,
         x: b.x ?? 50,
         y: b.y ?? 50,
+        rotation: b.rotation,
         running: false,
         compiledProgram: b.compiledProgram ?? null,
         serialOutput: '',
@@ -179,6 +180,8 @@ export function buildLoadPayload(project: RawProject) {
         // pre-feature projects; the compiler falls back to its defaults.
         boardOptions: b.boardOptions,
         spiffsFiles: b.spiffsFiles,
+        // What the user put on the board's own microSD slot.
+        sdFiles: b.sdFiles,
         // P2.4 — this board's declared manifest (per-board compile scope).
         libraries: b.libraries,
       }));

@@ -11,6 +11,7 @@
  *
  * Note: wokwi-elements pinInfo x/y are already in CSS pixels.
  */
+import { readPinInfo } from './readPinInfo';
 
 /**
  * Calculates the absolute canvas position of a specific pin.
@@ -33,6 +34,10 @@ export function calculatePinPosition(
   componentX: number,
   componentY: number,
   rotation: number = 0,
+  /** Explicit unrotated box to rotate about, its top-left at (componentX,
+   *  componentY). Boards pass their footprint: they have no
+   *  DynamicComponent wrapper to measure. */
+  pivotBox?: { w: number; h: number },
 ): { x: number; y: number } | null {
   // Get the DOM element
   const element = document.getElementById(componentId);
@@ -49,7 +54,7 @@ export function calculatePinPosition(
   }
 
   // Access the pinInfo property (all wokwi-elements expose this)
-  const pinInfo = (element as any).pinInfo;
+  const pinInfo: any = readPinInfo(element);
   if (!pinInfo || !Array.isArray(pinInfo)) {
     if (import.meta.env.MODE !== 'test') {
       console.warn(`[pinPositionCalculator] Component ${componentId} does not have pinInfo`);
@@ -131,7 +136,15 @@ export function calculatePinPosition(
   // with the component, surfacing as an obvious "wires disconnected
   // from the pin" once the user pressed R.
   const angle = ((rotation % 360) + 360) % 360;
-  if (angle !== 0) {
+  if (angle !== 0 && pivotBox) {
+    const pivotX = componentX + pivotBox.w / 2;
+    const pivotY = componentY + pivotBox.h / 2;
+    const theta = (angle * Math.PI) / 180;
+    const dx = pinX - pivotX;
+    const dy = pinY - pivotY;
+    pinX = pivotX + (dx * Math.cos(theta) - dy * Math.sin(theta));
+    pinY = pivotY + (dx * Math.sin(theta) + dy * Math.cos(theta));
+  } else if (angle !== 0) {
     const wrapper = element.closest('.dynamic-component-wrapper') as HTMLElement | null;
     if (wrapper) {
       const wrapperW = wrapper.offsetWidth;
@@ -202,7 +215,7 @@ export function getAllPinPositions(
   const element = document.getElementById(componentId);
   if (!element) return [];
 
-  const pinInfo = (element as any).pinInfo;
+  const pinInfo: any = readPinInfo(element);
   if (!pinInfo || !Array.isArray(pinInfo)) return [];
 
   return pinInfo.map((pin: any) => ({

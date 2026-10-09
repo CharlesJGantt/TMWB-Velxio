@@ -6,6 +6,51 @@
 > return `true` so that the serial monitor shows real sensor data instead of "MPU6050 not found!" /
 > "BMP280 not found! Check wiring.".
 > Target audience: future maintainers who need to understand *why* the I2C slave code is the way it is.
+>
+> **Since 2026-09 (board-buses F5)**: the slaves described here no longer sit in one dict keyed by
+> address. The worker keeps them in an `I2cBusTable` (`backend/app/services/i2c_bus_table.py`) by
+> (controller, address) and by identity, placed on the controller the tab's bus map says the part's
+> SDA is wired to, so two identical sensors on `Wire` and `Wire1` are two devices and removing one
+> never evicts the other. The event constants, the ACK convention and the write-then-read sequence
+> below are unchanged. The model is in [board-buses.md](./board-buses.md).
+>
+> **Since 2026-09 (i2c-model-fidelity)**: the `MPU6050Slave` of section 7 is the one this
+> investigation ended with, kept here as the record of it. The one in the tree now behaves like the
+> chip where a driver can tell: it powers on asleep (`PWR_MGMT_1 = 0x40`), `DEVICE_RESET` restores
+> the power-on registers and is gone before the next read, the sample block `0x3B`-`0x48` is
+> worked out from the panel's values and the range the sketch selected (1 g at 8 g is 4096 counts,
+> so the gallery sketch prints 9.81 m/s² and not 39.23) and is latched when a read begins. It is the
+> twin of `VirtualMPU6050` in the tab, and both replay the same bus vectors,
+> `test/fixtures/i2c-vectors/mpu6050.json`. The worker seeds it from the sensor record, so the
+> first read shows the panel's values (24 °C, not 25). The per-event log line and the `i2c_trace`
+> message of "Debugging Infrastructure" are off unless the backend runs with
+> `VELXIO_I2C_TRACE=1`: they cost about 0.8 ms on every register read.
+>
+> **Since 2026-09 (i2c-model-fidelity)**: `DS1307Slave` and `DS3231Slave` are the twins of
+> `VirtualDS1307` and `VirtualDS3231` in the tab, and replay the same bus vectors,
+> `test/fixtures/i2c-vectors/ds1307.json` and `ds3231.json`. They used to drop every write and
+> to read the clock of the container, in UTC. Now:
+>
+> - The time is the tab's. The sensor record carries `epochMs` and `utcOffsetMin`, stamped when
+>   the board is run, and `TabClock` tells the tab's wall clock from the worker's with them. A
+>   difference of under a minute between the two epochs is taken as the delivery of the record
+>   and ignored.
+> - A time the sketch writes is kept and counted from, with one exception: the build time of the
+>   firmware, which is what `rtc.adjust(DateTime(F(__DATE__), F(__TIME__)))` writes. The worker
+>   finds the two strings in the image it was handed (`find_build_times`), and a clock that is
+>   set to them stays on the tab's time.
+> - DS1307: CH stops the clock, CONTROL and the 56 bytes of RAM are stored, the pointer wraps at
+>   `0x3F`. DS3231: CONTROL powers on at `0x1C` and STATUS at `0x08` (OSF clear, so
+>   `lostPower()` is false: a module somebody set, as CH is 0), the alarms set A1F and A2F, the
+>   temperature is two's complement and starts from the record, the pointer wraps at `0x12`.
+> - The seven time registers are latched at every START, so a burst cannot straddle a second.
+>
+> The `BMP280Slave` of section 8 changed the same way, as the twin of `VirtualBMP280`
+> (`test/fixtures/i2c-vectors/bmp280.json`). It powers on in sleep mode with `0x80000` in its data
+> registers and measures once the sketch writes a mode to `ctrl_meas` (`0xF4`); forced mode is one
+> measurement and reads back as sleep mode; `measuring` (status bit 3) reads 1 once after a
+> conversion starts; `0xB6` written to `0xE0` is a reset; and a write is pairs of register address
+> and data, with no auto-increment.
 
 ---
 
@@ -302,8 +347,8 @@ updated to use the correct constants and `return 0` for ACK.
 | Class | Address | Notable registers |
 |---|---|---|
 | `BMP280Slave` | 0x76 / 0x77 | `0xD0` = chip ID (`0x58`), calibration regs, temperature/pressure raw data |
-| `DS1307Slave` | 0x68 | Timekeeping registers (seconds, minutes, hours, day, date, month, year) |
-| `DS3231Slave` | 0x68 | Same layout as DS1307 plus temperature registers |
+| `DS1307Slave` | 0x68 | Timekeeping registers (seconds, minutes, hours, day, date, month, year), CONTROL, 56 bytes of RAM |
+| `DS3231Slave` | 0x68 | Same time registers, two alarms, CONTROL, STATUS, aging offset, temperature |
 | `I2CWriteSink` | configurable | Accepts any WRITE silently (for LCD, OLED, etc.) |
 
 ---

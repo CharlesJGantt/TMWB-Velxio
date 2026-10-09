@@ -1,6 +1,6 @@
 /**
  * proBoardRegistry — runtime registration seam for boards a private overlay
- * (velxio.com) ships outside the OSS tree.
+ * (velxio.dev) ships outside the OSS tree.
  *
  * The OSS BoardKind union and its compiler-enforced Record maps stay exactly
  * as they are for the open boards. An overlay calls registerProBoards() at
@@ -44,6 +44,32 @@ export interface ProBoardSimulator {
   stop(): void;
   detachPioPeripheral?(): void;
 }
+
+/**
+ * A microSD slot the board carries itself.
+ *
+ * The BUS is what the host has to model. An SPI slot shares SCK/MOSI/MISO with
+ * whatever else sits on that bus, so the bridge needs the CS pin to know when
+ * the card is the one being addressed (a standalone SD component on the canvas
+ * still overrides this to un-gated). An SDMMC slot is its own controller with
+ * no chip select at all — declaring a CS pin for it would be a fiction, which
+ * is why this is a union and not an optional number.
+ *
+ * What both have in common is the part the user sees: a place to put files.
+ * That is why the board's properties panel offers the same upload panel a card
+ * component gets, and why the run path builds the card image either way.
+ */
+export type BuiltInSdSlot =
+  /**
+   * A slot on an SPI bus. The chip select is what puts the card panel on the
+   * board's context menu; the other three wires are the same hardware fact and
+   * say WHICH bus the slot is on, which is what a host outside this tab needs
+   * to be told (project board-buses-2026-09, F4). A board whose builtins
+   * already register the slot themselves may leave them out.
+   */
+  | { bus: 'spi'; csPin: number; sck?: number; mosi?: number; miso?: number }
+  /** A slot on the chip's own SDMMC host: no bus to share, no select to gate. */
+  | { bus: 'sdmmc' };
 
 export interface ProBoardDef {
   /** The board id — behaves like a BoardKind everywhere at runtime. */
@@ -144,8 +170,8 @@ export interface ProBoardDef {
    *  argument is the store's PinManager instance. */
   createSimulator?: (pm: unknown) => ProBoardSimulator;
   /** Load compiled firmware into a createSimulator() instance at run time —
-   *  the overlay owns the whole sequence (PIO attach, binary load, demo I2C
-   *  devices, ...). `program` is the compiled artifact exactly as the store
+   *  the overlay owns the whole sequence (PIO attach, binary load, the
+   *  board's own I2C chips, ...). `program` is the compiled artifact exactly as the store
    *  holds it (base64/hex string, same value RP2040Simulator.loadBinary gets). */
   loadFirmware?: (
     sim: ProBoardSimulator,
@@ -155,9 +181,8 @@ export interface ProBoardDef {
   /** Built-in bridge sensors registered without wiring (e.g. an on-board I2C
    *  keyboard): pushed into the ESP32 bridge's sensor config on every run. */
   builtInSensors?: Array<{ sensor_type: string; pin: number; addr?: number }>;
-  /** Built-in microSD on a shared SPI bus: the CS pin the bridge must gate.
-   *  (A standalone SD card component still overrides this to un-gated.) */
-  builtInSdCsPin?: number;
+  /** A microSD slot the board carries itself — see BuiltInSdSlot. */
+  builtInSd?: BuiltInSdSlot;
   /** Board carries an on-board microphone whose bridge implements
    *  setMicrophoneSource (I2S RX sample injection): shows the canvas-header
    *  Mic toggle that streams the computer's microphone into it. */
@@ -301,6 +326,32 @@ export function registerGuestSetup(kind: string, line: string): void {
  *  `guestSetup` first, then anything registered for an OSS board kind. */
 export function getGuestSetup(kind: string): string | undefined {
   return registry.get(kind)?.guestSetup ?? guestSetups.get(kind);
+}
+
+// ── Extra request ops for a Linux board's guest ─────────────────────────
+//
+// A Linux guest asks the canvas for things through one grammar of request
+// lines (`I2C ...`, `SPI ...`, `W1 ...`), answered by the board's shim in the
+// browser whether the script runs in the tab or in a guest behind the relay.
+// The grammar is the open-source tree's; what hangs off a board is not always:
+// a camera on the CSI ribbon has no pins and no bus, and whoever provides the
+// camera needs a way to answer `CAM ...` without the shim learning what a
+// camera is. An op registered here is consulted for any first token the
+// built-in grammar does not know. Return the reply line, or null for none.
+export type PiBusOpHandler = (boardId: string, tokens: string[]) => string | null;
+
+const piBusOps = new Map<string, PiBusOpHandler>();
+
+/** Returns the function that removes it again. */
+export function registerPiBusOp(op: string, handler: PiBusOpHandler): () => void {
+  piBusOps.set(op, handler);
+  return () => {
+    if (piBusOps.get(op) === handler) piBusOps.delete(op);
+  };
+}
+
+export function getPiBusOp(op: string): PiBusOpHandler | undefined {
+  return piBusOps.get(op);
 }
 
 // ── Built-in peripheral attachment for boards the OSS tree already owns ──

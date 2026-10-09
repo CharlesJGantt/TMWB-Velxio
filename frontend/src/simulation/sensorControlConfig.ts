@@ -23,6 +23,18 @@ export interface SliderControl {
    *  slider crams all the behaviour into its first few percent — the
    *  night-light example toggled at 2% of travel. Requires min >= 0. */
   scale?: 'log';
+  /** The component property that holds this control's PROJECT value, when it
+   *  is not `key` itself (the IR remote's `address` lives in `irAddress`).
+   *  Reset and the panel read the project value from it. */
+  propertyKey?: string;
+  /** Names of the values, for a slider that is really a CHOICE among a few
+   *  (an event kind, a surface, a key): value -> label. The panel and the
+   *  property dialog then show a select with these labels instead of a bare
+   *  number; the value stored and dispatched stays the number. A two-position
+   *  slider (0/1, step 1) without options is an on/off switch and shows as a
+   *  checkbox; one whose formatValue names both positions is a choice between
+   *  those two names. See sliderInput(). */
+  options?: Record<number, string>;
 }
 
 export interface ButtonControl {
@@ -40,6 +52,70 @@ export interface SensorControlDef {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/** How a slider is edited: a range, an on/off switch, or a choice of names. */
+export type SliderInput =
+  | { kind: 'range' }
+  | { kind: 'toggle' }
+  | { kind: 'choice'; options: { value: number; label: string }[] };
+
+/** A formatted position that just prints its own number ("0", "1.0"), as
+ *  opposed to a name for it ("Manual", "0x68"). */
+const printsItself = (text: string, v: number) => text.trim() !== '' && Number(text.trim()) === v;
+
+/**
+ * The input a slider really is. Many sensors model a switch ("magnet
+ * present", "probe disconnected") or a small set of named cases ("event:
+ * strike / disturber / noise") as an integer slider, and a bare number is a
+ * poor way to set either:
+ *  - declared `options` make it a choice among those labels (values outside
+ *    min..max are dropped, the rest sorted);
+ *  - a 0..1 slider with step 1 is a two-position switch: a choice when its
+ *    formatValue names the positions (Source: Manual / Thermal zone), else a
+ *    checkbox (on = 1);
+ *  - everything else stays a range.
+ * The value is a number in every case, so stored projects, Reset and the
+ * parts' update callbacks are unchanged.
+ */
+export function sliderInput(ctrl: SliderControl): SliderInput {
+  if (ctrl.options) {
+    const options = Object.entries(ctrl.options)
+      .map(([v, label]) => ({ value: Number(v), label }))
+      .filter((o) => Number.isFinite(o.value) && o.value >= ctrl.min && o.value <= ctrl.max)
+      .sort((a, b) => a.value - b.value);
+    if (options.length > 0) return { kind: 'choice', options };
+  }
+  if (ctrl.min === 0 && ctrl.max === 1 && ctrl.step === 1 && ctrl.scale !== 'log') {
+    if (ctrl.formatValue) {
+      const off = ctrl.formatValue(0);
+      const on = ctrl.formatValue(1);
+      if (!printsItself(off, 0) && !printsItself(on, 1) && off !== on) {
+        return {
+          kind: 'choice',
+          options: [
+            { value: 0, label: off },
+            { value: 1, label: on },
+          ],
+        };
+      }
+    }
+    return { kind: 'toggle' };
+  }
+  return { kind: 'range' };
+}
+
+/** The option a stored value selects: the nearest one, so a project that
+ *  holds 0.6 (an old slider save) shows the option the part acts on. */
+export function nearestOption(
+  options: { value: number; label: string }[],
+  value: number,
+): { value: number; label: string } | undefined {
+  let best: { value: number; label: string } | undefined;
+  for (const o of options) {
+    if (!best || Math.abs(o.value - value) < Math.abs(best.value - value)) best = o;
+  }
+  return best;
+}
 
 const oneDecimal = (v: number) => v.toFixed(1);
 /** NEC address/command as every decoder prints them: 0x and two hex digits. */
@@ -71,6 +147,8 @@ export function logValueToSlider(value: number, min: number, max: number): numbe
 
 export const SENSOR_CONTROLS: Record<string, SensorControlDef> = {
   // ── MPU-6050 6-axis IMU ────────────────────────────────────────────────────
+  // The sliders span the chip's widest ranges (16 g, 2000 deg/s). Past the
+  // range the sketch selected, the output stays at full scale, as the chip's.
   mpu6050: {
     title: 'MPU6050 Accelerometer + Gyroscope',
     controls: [
@@ -79,8 +157,8 @@ export const SENSOR_CONTROLS: Record<string, SensorControlDef> = {
         type: 'slider',
         key: 'accelX',
         label: 'X',
-        min: -2,
-        max: 2,
+        min: -16,
+        max: 16,
         step: 0.01,
         unit: 'g',
         defaultValue: 0,
@@ -90,8 +168,8 @@ export const SENSOR_CONTROLS: Record<string, SensorControlDef> = {
         type: 'slider',
         key: 'accelY',
         label: 'Y',
-        min: -2,
-        max: 2,
+        min: -16,
+        max: 16,
         step: 0.01,
         unit: 'g',
         defaultValue: 0,
@@ -101,8 +179,8 @@ export const SENSOR_CONTROLS: Record<string, SensorControlDef> = {
         type: 'slider',
         key: 'accelZ',
         label: 'Z',
-        min: -2,
-        max: 2,
+        min: -16,
+        max: 16,
         step: 0.01,
         unit: 'g',
         defaultValue: 1,
@@ -113,8 +191,8 @@ export const SENSOR_CONTROLS: Record<string, SensorControlDef> = {
         type: 'slider',
         key: 'gyroX',
         label: 'X',
-        min: -250,
-        max: 250,
+        min: -2000,
+        max: 2000,
         step: 1,
         unit: '°/sec',
         defaultValue: 0,
@@ -124,8 +202,8 @@ export const SENSOR_CONTROLS: Record<string, SensorControlDef> = {
         type: 'slider',
         key: 'gyroY',
         label: 'Y',
-        min: -250,
-        max: 250,
+        min: -2000,
+        max: 2000,
         step: 1,
         unit: '°/sec',
         defaultValue: 0,
@@ -135,8 +213,8 @@ export const SENSOR_CONTROLS: Record<string, SensorControlDef> = {
         type: 'slider',
         key: 'gyroZ',
         label: 'Z',
-        min: -250,
-        max: 250,
+        min: -2000,
+        max: 2000,
         step: 1,
         unit: '°/sec',
         defaultValue: 0,
@@ -362,6 +440,7 @@ export const SENSOR_CONTROLS: Record<string, SensorControlDef> = {
       {
         type: 'slider',
         key: 'address',
+        propertyKey: 'irAddress',
         label: 'Address',
         min: 0,
         max: 255,
@@ -373,6 +452,7 @@ export const SENSOR_CONTROLS: Record<string, SensorControlDef> = {
       {
         type: 'slider',
         key: 'command',
+        propertyKey: 'irCommand',
         label: 'Command',
         min: 0,
         max: 255,
@@ -531,7 +611,7 @@ export const SENSOR_CONTROLS: Record<string, SensorControlDef> = {
 };
 
 // ── Overlay seam ─────────────────────────────────────────────────────────────
-// A private build (velxio.com) registers sensor-control definitions for the
+// A private build (velxio.dev) registers sensor-control definitions for the
 // sensors it ships outside the OSS tree (e.g. the DFRobot Gravity analog
 // family). Same contract as proBoardRegistry / registerComponentDoc: dead code
 // in a pure OSS build. Read every SENSOR_CONTROLS lookup through
@@ -568,6 +648,114 @@ export function getSensorControlForComponent(component: {
   return getSensorControl(component.metadataId) ?? instanceResolver?.(component);
 }
 
+/** A number from a stored property value: numbers as they are, numeric
+ *  strings (the property dialog and older saves write strings, hex included:
+ *  the IR remote stores '0x45'), and nothing else. */
+function propertyNumber(raw: unknown): number | undefined {
+  if (typeof raw === 'number') return Number.isFinite(raw) ? raw : undefined;
+  if (typeof raw === 'string' && raw.trim() !== '') {
+    const n = Number(raw.trim());
+    return Number.isFinite(n) ? n : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * The values a sensor has in the PROJECT, in control-key space: what the user
+ * configured (the component's properties, or `properties.attrs` on a custom
+ * chip, where the chip reads them through vx_attr_read), with the panel default
+ * only for a control the project leaves unset.
+ *
+ * Reset brings a sensor back to these and the panel opens on them. A slider
+ * moved during a run is a live input and never changes them: the parts that
+ * mirror a live value into properties (for the SPICE netlist) do it through
+ * the store's applyLivePropertyChange, which Reset takes back out.
+ */
+export function projectSensorValues(
+  component: { id: string; metadataId?: string; properties?: Record<string, unknown> },
+  def: SensorControlDef,
+): Record<string, number | boolean> {
+  const props = component.properties ?? {};
+  const source =
+    component.metadataId === 'custom-chip'
+      ? ((props.attrs ?? {}) as Record<string, unknown>)
+      : props;
+  const values: Record<string, number | boolean> = { ...def.defaultValues };
+  for (const ctrl of def.controls) {
+    if (ctrl.type !== 'slider') continue;
+    const n = propertyNumber(source[ctrl.propertyKey ?? ctrl.key]);
+    if (n !== undefined) values[ctrl.key] = n;
+    else if (values[ctrl.key] === undefined) values[ctrl.key] = ctrl.defaultValue;
+  }
+  return values;
+}
+
+/**
+ * One PROJECT value of a sensor, as the property dialog edits it: a slider of
+ * the sensor's panel, read from the same property the part and
+ * projectSensorValues read (propertyKey, else key), with the slider's range,
+ * step, unit and default. Derived from the control definition on purpose, so
+ * the dialog and the panel cannot drift apart and every sensor with a panel,
+ * catalogue or overlay-registered, gets its fields without per-part metadata.
+ */
+export interface SensorProjectField {
+  /** Control key: what the panel dispatches and the part's update reads. */
+  key: string;
+  /** Component property that stores the project value. */
+  property: string;
+  label: string;
+  min: number;
+  max: number;
+  step: number;
+  unit: string;
+  defaultValue: number;
+  /** The project value: the stored property, or the panel default. */
+  value: number;
+  /** The panel slider is logarithmic: the dialog edits the value itself,
+   *  never a position on the log axis. */
+  log: boolean;
+  /** Range, on/off switch or named choice (sliderInput()). */
+  input: SliderInput;
+  formatValue?: (v: number) => string;
+}
+
+/**
+ * The fields the property dialog shows for a sensor's project values. Buttons
+ * (Simulate motion, Send) are actions, not values, and are left out. A custom
+ * chip gets none: its attributes already have their own editor, fed from
+ * chip.json and stored under properties.attrs.
+ */
+export function sensorProjectFields(component: {
+  id: string;
+  metadataId?: string;
+  properties?: Record<string, unknown>;
+}): SensorProjectField[] {
+  if (component.metadataId === 'custom-chip') return [];
+  const def = getSensorControlForComponent(component);
+  if (!def) return [];
+  const values = projectSensorValues(component, def);
+  const fields: SensorProjectField[] = [];
+  for (const ctrl of def.controls) {
+    if (ctrl.type !== 'slider') continue;
+    const value = values[ctrl.key];
+    fields.push({
+      key: ctrl.key,
+      property: ctrl.propertyKey ?? ctrl.key,
+      label: ctrl.label,
+      min: ctrl.min,
+      max: ctrl.max,
+      step: ctrl.step,
+      unit: ctrl.unit,
+      defaultValue: ctrl.defaultValue,
+      value: typeof value === 'number' ? value : ctrl.defaultValue,
+      log: ctrl.scale === 'log',
+      input: sliderInput(ctrl),
+      formatValue: ctrl.formatValue,
+    });
+  }
+  return fields;
+}
+
 export function registerSensorControls(defs: Record<string, SensorControlDef>): void {
   Object.assign(proSensorControls, defs);
 }
@@ -575,4 +763,17 @@ export function registerSensorControls(defs: Record<string, SensorControlDef>): 
 export function getSensorControl(id: string | null | undefined): SensorControlDef | undefined {
   if (!id) return undefined;
   return SENSOR_CONTROLS[id] ?? proSensorControls[id];
+}
+
+/**
+ * Where a sensor's control `key` starts when the project leaves it unset: the
+ * control definition's default, the one number the panel, the property
+ * dialog and the part all share. A part reads its starting value from here
+ * instead of a literal of its own (the BMP280 used to start at 25 C while
+ * its panel and dialog said 24). `fallback` is only for a part whose control
+ * definition is missing, which the sensor-defaults test forbids.
+ */
+export function sensorControlDefault(id: string, key: string, fallback: number): number {
+  const v = getSensorControl(id)?.defaultValues[key];
+  return typeof v === 'number' ? v : fallback;
 }

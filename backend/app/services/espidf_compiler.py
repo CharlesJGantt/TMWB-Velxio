@@ -922,6 +922,26 @@ def _stash_for_next_build(src: Path, stash: Path) -> None:
         pass
 
 
+_MAIN_INCLUDE_TOKEN = 'INCLUDE_DIRS "."'
+_USER_LIBS_INCLUDE_DIR = '"../user_libs/user_libs_all"'
+
+
+def main_cmake_with_user_libs(cmake_text: str) -> str:
+    """main/CMakeLists.txt with the merged library headers on main's include path.
+
+    INCLUDE_DIRS is the ONLY thing to add. main names no REQUIRES on purpose:
+    ESP-IDF then makes it depend on every component in the build, user_libs_all
+    included (project.cmake does that only "when user did not set
+    REQUIRES/PRIV_REQUIRES manually"). This function used to append
+    user_libs_all to a REQUIRES line; writing one back would shrink the IDF a
+    sketch can reach down to the named closure again, which is issue #342.
+    """
+    if _USER_LIBS_INCLUDE_DIR in cmake_text:
+        return cmake_text
+    return cmake_text.replace(
+        _MAIN_INCLUDE_TOKEN, f'{_MAIN_INCLUDE_TOKEN} {_USER_LIBS_INCLUDE_DIR}')
+
+
 def _restore_mtime_if_unchanged(path: Path, stash: Path) -> bool:
     """Give a regenerated configure input its previous mtime when its bytes
     did not change, so ninja's RERUN_CMAKE rule does not see it as new.
@@ -1369,8 +1389,16 @@ class ESPIDFCompiler:
         return True
 
     def _is_esp32c3(self, board_fqbn: str) -> bool:
-        """Return True if FQBN targets ESP32-C3 (RISC-V)."""
-        return 'esp32c3' in board_fqbn or 'esp32-c3' in board_fqbn
+        """Return True if FQBN targets ESP32-C3 (RISC-V).
+
+        Lowercased like every sibling below, and for a reason this one learned
+        the hard way: `esp32:esp32:XIAO_ESP32C3` is spelled in capitals, so the
+        case-sensitive test missed it, the target fell through to 'esp32', and
+        a RISC-V board was handed the Xtensa toolchain. It failed loudly here
+        (a missing HWCDCSerial), but the class of bug is the silent one.
+        """
+        f = board_fqbn.lower()
+        return 'esp32c3' in f or 'esp32-c3' in f
 
     def _is_esp32c6(self, board_fqbn: str) -> bool:
         """Return True if FQBN targets ESP32-C6 (RISC-V, IDF v5.x only)."""
@@ -1746,6 +1774,38 @@ class ESPIDFCompiler:
             if re.search(r'#include\s*[<"]' + pattern + r'[">]', code):
                 deps[name] = version
         return deps
+
+    @staticmethod
+    def _without_merged_duplicates(deps: dict, merged_libs: dict | None) -> dict:
+        """One library, one copy.
+
+        A registry component and an Arduino library can be the same project:
+        `lvgl/lvgl` and the LVGL a user installs from the Library Manager are.
+        Declaring both puts two copies of it in the build, each with its own
+        include root, and then `#include <lvgl.h>` in the sketch resolves to
+        whichever path comes first while the project's `lv_conf.h` configures
+        the other one — the sketch and the library compiled against different
+        configurations, which is exactly as broken as it sounds (issue #352).
+
+        The installed Arduino library wins. It is the one the user chose, the
+        one their config header is written for, and the one arduino-cli would
+        have used. The registry copy is only there to cover headers nobody
+        installed.
+        """
+        if not deps or not merged_libs:
+            return deps
+        norm = lambda n: n.lower().replace('-', '_').replace(' ', '_')
+        have = {norm(name) for name in merged_libs.values()}
+        kept: dict = {}
+        for dep, version in deps.items():
+            if norm(dep.split('/')[-1]) in have:
+                logger.info(
+                    '[espidf] %s is installed as an Arduino library — not also '
+                    'fetching the registry component', dep
+                )
+                continue
+            kept[dep] = version
+        return kept
 
     # IDF components that ship INSIDE the IDF tree (not the registry) and are
     # NOT on an Arduino sketch's include path by default. arduino-esp32 3.x
@@ -2201,6 +2261,22 @@ class ESPIDFCompiler:
         'sdkconfig.h', 'zconf.h',
     })
 
+    # A library that finds an ESP-IDF Kconfig prefers it over the header the
+    # project supplied — on a real IDF project that IS the right answer. Here
+    # it is not: a library the user installed from the Arduino index is
+    # configured the Arduino way, by a header next to the sketch, and it only
+    # sees a Kconfig at all because we compile it inside an IDF component. So
+    # when the project ships the header, the library is told to leave the
+    # Kconfig alone. Each entry is the library's own documented escape hatch,
+    # not a patch to its sources.
+    _ARDUINO_CONFIG_WINS: dict[str, tuple[str, ...]] = {
+        # LVGL includes lv_conf_kconfig.h unconditionally unless this is set,
+        # and our sdkconfig carries its symbols half-filled: the build dies on
+        # "LV_MEM_SIZE >= 2kB is required" with the user's lv_conf.h sitting
+        # right there, unread (issue #352).
+        'lv_conf.h': ('LV_KCONFIG_IGNORE',),
+    }
+
     # ...and the general shape of one. Config headers are named by convention
     # across the whole Arduino ecosystem, and one live build showed SIX of
     # them being resolved against the shared library dir in a single compile
@@ -2331,15 +2407,119 @@ class ESPIDFCompiler:
         (the Arduino default), so we allow it. Only libraries that
         explicitly enumerate architectures WITHOUT esp32/* are rejected —
         those are written for another platform and would not compile.
+
+        "Does not exclude esp32" is not the same as "builds on esp32", though.
+        A library that leaves architectures open (or says `*`) but includes an
+        AVR libc header with no condition around it cannot compile here — the
+        header does not exist in this toolchain. `evive` is one: its evive.h
+        pulls <util/delay.h> unconditionally, and a same-named header dragged
+        its whole tree into a user's ESP32 build (issue #352). A library that
+        explicitly names esp32 is trusted as written.
         """
         arch = self._parse_library_properties(lib_root).get('architectures', '').strip()
-        if not arch:
-            return True
         arches = {a.strip().lower() for a in arch.split(',') if a.strip()}
+        if self._ESP32_LIB_ARCH in arches:
+            return True
         # 'all' is a common non-spec synonym for '*' (e.g. LiquidCrystal_I2C
         # 2.0.0 declares architectures=all) — treating it as unknown skipped
         # the most popular I2C LCD library on every ESP32 build (issue #257).
-        return '*' in arches or 'all' in arches or self._ESP32_LIB_ARCH in arches
+        if arches and not ('*' in arches or 'all' in arches):
+            return False
+        return self._foreign_platform_include(lib_root) is None
+
+    # AVR libc header namespaces. Not a list of headers to refuse: a header in
+    # these is refused only if THIS toolchain cannot find it (see below).
+    _FOREIGN_INCLUDE_PREFIXES: tuple[str, ...] = ('avr/', 'util/')
+    _foreign_include_cache: dict = {}
+
+    def _foreign_platform_include(self, lib_root: Path) -> str | None:
+        """The first platform header this library includes UNCONDITIONALLY
+        that the ESP32 build cannot provide — or None.
+
+        Conditional includes are fine and common: `#ifdef __AVR__ #include
+        <avr/pgmspace.h> #endif` is how a portable library looks. What rules a
+        library out is an include no preprocessor condition protects, because
+        that line runs on every platform. An include guard does not count as a
+        condition (it wraps the whole header on every platform), so an
+        `#ifndef X` followed by `#define X` is not counted.
+
+        Whether a header "cannot be provided" is asked of the real include
+        roots — the Arduino cores and the IDF components — not of a list, so a
+        core that grows an avr/ compatibility header is honoured the day it
+        ships one.
+        """
+        key = str(lib_root)
+        if key in self._foreign_include_cache:
+            return self._foreign_include_cache[key]
+        found: str | None = None
+        cores = [r for r in (getattr(self, 'arduino_path', ''),
+                             getattr(self, 'arduino5_path', '')) if r]
+        idfs = [r for r in (getattr(self, 'idf_path', ''),
+                            getattr(self, 'idf5_path', '')) if r]
+
+        def provided(header: str) -> bool:
+            # Where an Arduino sketch's <...> can land: the core itself, and
+            # the IDF components' public include dirs. One wildcard level
+            # each — a recursive walk of the IDF per header would cost
+            # seconds, and nothing lives deeper than this.
+            for c in cores:
+                if next(Path(c).glob(f'cores/*/{header}'), None):
+                    return True
+            for i in idfs:
+                if next(Path(i).glob(f'components/*/include/{header}'), None):
+                    return True
+                if (Path(i) / 'components' / 'newlib' / 'platform_include' / header).exists():
+                    return True
+            return False
+        include_re = re.compile(r'^\s*#\s*include\s*<([^>]+)>')
+        cond_open = re.compile(r'^\s*#\s*(if|ifdef|ifndef)\b')
+        cond_close = re.compile(r'^\s*#\s*endif\b')
+        guard_open = re.compile(r'^\s*#\s*ifndef\s+(\w+)')
+        guard_def = re.compile(r'^\s*#\s*define\s+(\w+)')
+        scanned = 0
+        for path in sorted(lib_root.rglob('*')):
+            if found or scanned > 400:
+                break
+            if path.suffix.lower() not in ('.h', '.hpp', '.c', '.cpp') or not path.is_file():
+                continue
+            if any(part in ('examples', 'extras', 'test', 'tests') for part in path.parts):
+                continue
+            scanned += 1
+            try:
+                lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+            except OSError:
+                continue
+            depth = 0
+            guards = 0  # depths opened by an include guard, not a condition
+            for i, line in enumerate(lines):
+                g = guard_open.match(line)
+                if g and i + 1 < len(lines):
+                    d = guard_def.match(lines[i + 1])
+                    if d and d.group(1) == g.group(1):
+                        depth += 1
+                        guards += 1
+                        continue
+                if cond_open.match(line):
+                    depth += 1
+                    continue
+                if cond_close.match(line):
+                    depth = max(0, depth - 1)
+                    guards = min(guards, depth)
+                    continue
+                if depth - guards > 0:
+                    continue
+                m = include_re.match(line)
+                if not m:
+                    continue
+                header = m.group(1).strip()
+                if not header.startswith(self._FOREIGN_INCLUDE_PREFIXES):
+                    continue
+                if (lib_root / header).exists() or provided(header):
+                    continue
+                found = header
+                break
+        self._foreign_include_cache[key] = found
+        return found
 
     @staticmethod
     def _norm_lib_name(name: str) -> str:
@@ -2430,6 +2610,114 @@ class ESPIDFCompiler:
         # link error as transient and built it twice (587 retries on
         # 2026-09-15, none of which could help).
         return bool(re.search(r'^\s*failed:[^\n]*bootloader', text, re.M))
+
+    def _libraries_for_missing_headers(
+        self, headers: list[str], allowed: set[str]
+    ) -> tuple[set[str], dict[str, dict]]:
+        """Which libraries to add to a scope that could not find `headers` —
+        one per header, chosen by authority — and why the others were not.
+
+        This is what a scoped compile's retry widens by, instead of re-running
+        the whole include graph against every library on the server. On a
+        shared cache that "scan-all" sees libraries OTHER users installed, and
+        it resolves by file name, first match wins: a user declaring LovyanGFX,
+        TJpg_Decoder, WiFiManager and lvgl had a same-named header pull in the
+        entire tree of `evive`, an AVR library someone else had installed, and
+        the build died inside it (issue #352; the same shape as Hash.h ->
+        stemihexapod before it, which was patched by adding the name to a
+        list — a list only covers the names someone has already reported).
+
+        Per header, in order of authority:
+          1. a library a DECLARED library lists in its `depends=` — the author
+             said so;
+          2. a library whose name is the header's (TJpg_Decoder.h ->
+             TJpg_Decoder);
+          3. the only candidate left, if there is exactly one.
+        Every candidate must also be able to build for ESP32. A header two
+        unrelated libraries both provide, with nothing to tell them apart, is
+        a question for the user, not a guess for the resolver.
+        """
+        report: dict[str, dict] = {
+            h: {'chosen': None, 'rejected': [], 'ambiguous': []} for h in headers
+        }
+        chosen: set[str] = set()
+        libs_dir = self._find_arduino_libraries_dir()
+        if not libs_dir or not libs_dir.is_dir():
+            return chosen, report
+        allowed_norm = {self._norm_lib_name(a) for a in allowed}
+        lib_dirs = [d for d in sorted(libs_dir.iterdir()) if d.is_dir()]
+
+        declared_depends: set[str] = set()
+        for lib_dir in lib_dirs:
+            if self._library_in_manifest(lib_dir, allowed_norm):
+                for dep in self._parse_library_properties(lib_dir).get('depends', '').split(','):
+                    name = dep.split('(')[0].strip()
+                    if name:
+                        declared_depends.add(self._norm_lib_name(name))
+
+        def names(lib_dir: Path) -> set[str]:
+            props = self._parse_library_properties(lib_dir).get('name', '')
+            return {self._norm_lib_name(lib_dir.name)} | (
+                {self._norm_lib_name(props)} if props else set()
+            )
+
+        for h in headers:
+            ok: list[tuple[str, Path]] = []
+            for lib_dir in lib_dirs:
+                if not any((root / h).exists() for root in (lib_dir, lib_dir / 'src')):
+                    continue
+                display = self._parse_library_properties(lib_dir).get('name') or lib_dir.name
+                if self._library_supports_esp32(lib_dir):
+                    ok.append((display, lib_dir))
+                else:
+                    bad = self._foreign_platform_include(lib_dir)
+                    report[h]['rejected'].append((
+                        display,
+                        f'it includes <{bad}>, which does not exist for ESP32'
+                        if bad else 'its library.properties excludes esp32',
+                    ))
+            stem = self._norm_lib_name(Path(h).stem)
+            by_dep = [c for c in ok if names(c[1]) & declared_depends]
+            by_name = [c for c in ok if stem in names(c[1])]
+            pick = (by_dep[0] if len(by_dep) == 1 else
+                    by_name[0] if len(by_name) == 1 else
+                    ok[0] if len(ok) == 1 else None)
+            if pick:
+                report[h]['chosen'] = pick[0]
+                chosen.add(pick[0])
+            else:
+                report[h]['ambiguous'] = [c[0] for c in ok]
+        return chosen, report
+
+    @staticmethod
+    def _explain_missing_headers(result: dict, missing: list[str], why: dict) -> dict:
+        """Put the real reason at the top of a failed scoped compile.
+
+        The compiler's own line — `fatal error: Button.h: No such file` — is
+        true but not actionable, and the alternative it used to show was worse:
+        an error from inside a library the user never named. Say which header
+        nothing in the project provides, and what the server has that almost
+        does.
+        """
+        lines: list[str] = []
+        for h in missing:
+            w = why.get(h) or {}
+            if w.get('chosen'):
+                continue  # it was added; whatever failed below is the story
+            line = f'<{h}>: none of the libraries in this project provides it.'
+            if w.get('rejected'):
+                line += ' Installed libraries that have one but cannot build for ESP32: ' + '; '.join(
+                    f'{n} ({r})' for n, r in w['rejected']) + '.'
+            if w.get('ambiguous'):
+                line += ' Several libraries provide it (' + ', '.join(w['ambiguous']) + \
+                        ') — add the one you mean to the project.'
+            if not w.get('rejected') and not w.get('ambiguous'):
+                line += ' No installed library provides it — install the one it belongs to.'
+            lines.append(line)
+        if lines:
+            result['error'] = '\n'.join(lines) + '\n\n' + str(result.get('error') or '')
+            result['missing_headers'] = list(missing)
+        return result
 
     def _suggest_libraries_for_headers(self, headers: list[str]) -> dict:
         """For each missing header, the installed libraries that provide it
@@ -3049,6 +3337,27 @@ class ESPIDFCompiler:
                 'target_compile_definitions(${COMPONENT_LIB} PRIVATE'
                 ' alloca=__builtin_alloca memcpy_P=memcpy memcmp_P=memcmp)\n'
             )
+            # ...and the "this project configures you the Arduino way" switches,
+            # one per config header the sketch actually ships.
+            _main_dir = Path(user_libs_dir).parent / 'main'
+            _cfg_defs = [
+                macro
+                for header, macros in self._ARDUINO_CONFIG_WINS.items()
+                for macro in macros
+                if (_main_dir / header).is_file()
+            ]
+            if _cfg_defs:
+                logger.info(
+                    f'[espidf] project config headers present -> {_cfg_defs}'
+                )
+                defs_block += (
+                    '# The project ships the library\'s own config header, so the\n'
+                    '# library must read THAT and not the IDF Kconfig it can see\n'
+                    '# from inside this component.\n'
+                    'target_compile_definitions(${COMPONENT_LIB} PRIVATE '
+                    + ' '.join(_cfg_defs)
+                    + ')\n'
+                )
 
         # The -Werror relaxations the main component gets, for the same reason
         # but stronger: these are LIBRARY sources the user cannot even edit.
@@ -3072,6 +3381,31 @@ class ESPIDFCompiler:
                 '    -Wno-error=uninitialized)\n'
             )
 
+        # The sketch's own folder, PRIVATE to these sources.
+        #
+        # This is the rule that makes a user-configurable library work at all.
+        # arduino-cli puts the sketch directory on the include path of every
+        # translation unit it compiles, libraries included, and a whole class
+        # of libraries is built on that: LVGL looks for the project's
+        # `lv_conf.h`, TFT_eSPI for `User_Setup.h`, NimBLE for `nimconfig.h`.
+        # The header lives next to the .ino and the LIBRARY includes it — and
+        # the library's sources compile in HERE, not in main, so exporting only
+        # each library's own root left them with no way to find it. LVGL then
+        # fell down its fallback chain to the Kconfig defaults and died on
+        # "LV_MEM_SIZE >= 2kB is required" (issue #352).
+        #
+        # Private, so the sketch folder reaches the library sources that ask
+        # for it without entering the include path of the core or of anything
+        # that merely depends on this component. Only when there is something
+        # to compile: with no SRCS this registers an INTERFACE library, where
+        # a PRIVATE include is a CMake error.
+        if cpp_files:
+            _sketch_dir = '"../../main"'
+            priv_include_dirs_line = (
+                f'{priv_include_dirs_line} {_sketch_dir}'
+                if priv_include_dirs_line
+                else f'PRIV_INCLUDE_DIRS {_sketch_dir}'
+            )
         _priv_cmake_line = (
             f'    {priv_include_dirs_line}\n' if priv_include_dirs_line else ''
         )
@@ -5166,25 +5500,46 @@ class ESPIDFCompiler:
                 )
                 missing = []
             if missing:
-                logger.warning(
-                    f'[espidf] scoped compile missing {missing} (not in manifest) — '
-                    f'retrying scan-all'
+                # Widen the scope by exactly the libraries that provide what was
+                # missing — never by "everything on the server". A scan-all
+                # retry resolved the whole graph against libraries OTHER users
+                # installed, by file name, and then reported ITS error as the
+                # sketch's: a user who declared four libraries was shown a build
+                # failure from inside a fifth, AVR-only, that they never named
+                # (issue #352). See _libraries_for_missing_headers.
+                extra, why = self._libraries_for_missing_headers(
+                    missing, set(allowed_libraries)
                 )
-                retry = await _attempt_safe(None)
-                if retry.get('success'):
-                    retry['manifest_incomplete'] = True
-                    retry['manifest_suggested_libraries'] = (
-                        self._suggest_libraries_for_headers(missing)
+                if extra:
+                    logger.warning(
+                        f'[espidf] scoped compile missing {missing} — retrying with '
+                        f'{sorted(extra)} added to the scope'
                     )
-                    return retry
-                # Both failed. The retry saw every installed library, so ITS
-                # error is the sketch's real one — the scoped attempt stops at
-                # the first undeclared transitive dependency, which is an
-                # artifact of the scope, not of the sketch. Prefer it whenever
-                # it carries text; fall through to the scoped result otherwise.
-                if str(retry.get('error') or retry.get('stderr') or '').strip():
-                    retry['scope_retry_failed'] = True
-                    result = retry
+                    retry = await _attempt_safe(set(allowed_libraries) | extra)
+                    if retry.get('success'):
+                        retry['manifest_incomplete'] = True
+                        retry['manifest_suggested_libraries'] = {
+                            h: [why[h]['chosen']] for h in missing if why[h]['chosen']
+                        }
+                        return retry
+                    # The retry saw the project's own libraries plus ones picked
+                    # for a header it asked for, so its error IS the project's.
+                    if str(retry.get('error') or retry.get('stderr') or '').strip():
+                        retry['scope_retry_failed'] = True
+                        result = retry
+                else:
+                    logger.warning(
+                        f'[espidf] scoped compile missing {missing}; no single '
+                        f'library provides them — not guessing'
+                    )
+                result = self._explain_missing_headers(result, missing, why)
+                suggested = {
+                    h: ([why[h]['chosen']] if why[h]['chosen'] else why[h]['ambiguous'])
+                    for h in missing
+                    if why[h]['chosen'] or why[h]['ambiguous']
+                }
+                if suggested:
+                    result['manifest_suggested_libraries'] = suggested
 
         # Quarantine (2026-09). A speculative merge that fails the build is
         # dropped and the build retried once. "Speculative" = merged for a
@@ -5577,26 +5932,15 @@ class ESPIDFCompiler:
                     speculative_out=speculative_out,
                 )
 
-            # Patch main/CMakeLists.txt — REQUIRES and INCLUDE_DIRS for user_libs_all.
+            # Patch main/CMakeLists.txt — INCLUDE_DIRS for user_libs_all.
             # The single merged component means one entry covers all external headers.
             if component_names:  # always ['user_libs_all'] when any lib was found
                 cmake_path = project_dir / 'main' / 'CMakeLists.txt'
-                cmake_text = cmake_path.read_text(encoding='utf-8')
-
-                for old_req in [r'REQUIRES ${_arduino_comp_name}', f'REQUIRES {arduino_comp_name}']:
-                    if old_req in cmake_text:
-                        cmake_text = cmake_text.replace(
-                            old_req, f'{old_req} user_libs_all'
-                        )
-                        break
-
-                cmake_text = cmake_text.replace(
-                    'INCLUDE_DIRS "."',
-                    'INCLUDE_DIRS "." "../user_libs/user_libs_all"',
+                cmake_path.write_text(
+                    main_cmake_with_user_libs(cmake_path.read_text(encoding='utf-8')),
+                    encoding='utf-8',
                 )
-
-                cmake_path.write_text(cmake_text, encoding='utf-8')
-                logger.info('[espidf] Patched main CMakeLists: REQUIRES += user_libs_all, INCLUDE_DIRS += user_libs_all')
+                logger.info('[espidf] Patched main CMakeLists: INCLUDE_DIRS += user_libs_all')
 
             # esp_camera.h used to come free: arduino-esp32 2.x shipped a precompiled
             # SDK with esp32-camera bundled under tools/sdk/<target>/include. The 3.x
@@ -5610,32 +5954,16 @@ class ESPIDFCompiler:
                 )
             )
             manifest_changed = self._sync_managed_components(
-                project_dir, self._detect_managed_components(sketch_src),
+                project_dir,
+                self._without_merged_duplicates(
+                    self._detect_managed_components(sketch_src), merged_libs_report
+                ),
             )
 
-            # Same idea for components that live in the IDF tree rather than the
-            # registry: they need to be in main's REQUIRES or the sketch cannot
-            # see their headers.
-            idf_comps = self._detect_idf_components(sketch_src)
-            if idf_comps:
-                cmake_path = project_dir / 'main' / 'CMakeLists.txt'
-                cmake_text = cmake_path.read_text(encoding='utf-8')
-                missing = [c for c in idf_comps if c not in cmake_text]
-                if missing:
-                    for old_req in [
-                        r'REQUIRES ${_arduino_comp_name}',
-                        f'REQUIRES {arduino_comp_name}',
-                    ]:
-                        if old_req in cmake_text:
-                            cmake_text = cmake_text.replace(
-                                old_req, old_req + ' ' + ' '.join(missing), 1
-                            )
-                            cmake_path.write_text(cmake_text, encoding='utf-8')
-                            logger.info(
-                                f'[espidf] main REQUIRES += {" ".join(missing)} '
-                                '(IDF components the sketch includes)'
-                            )
-                            break
+            # Components that live in the IDF tree (esp_lcd, esp_mm...) need no
+            # line here any more: main names no REQUIRES, so it depends on every
+            # component in the build and their headers resolve on their own.
+            # _detect_idf_components still feeds the build-dir identity.
         else:
             # Pure ESP-IDF mode (no Arduino component usable for this
             # target). Remove Arduino main.cpp to avoid conflict.

@@ -41,6 +41,7 @@ import { isStm32BoardKind } from '../../types/board';
 import type { BoardKind } from '../../types/board';
 import { stm32PinNameToLinear } from '../Stm32Bridge';
 import { boardPinToNumber } from '../../utils/boardPinMapping';
+import { sanitizeSpiceId } from './NetlistBuilder';
 
 // 3.3 V LVCMOS thresholds with a hysteresis band so a node hovering near the
 // midpoint doesn't chatter. A pulled-up idle input sits at ~3.3 V and a
@@ -68,7 +69,8 @@ export function connectDigitalInputsToMcu(): () => void {
   const lastLevel = new Map<string, boolean>();
 
   function injectDigitalInputs() {
-    const { nodeVoltages, pinNetMap, sourcedNets } = useElectricalStore.getState();
+    const { nodeVoltages, pinNetMap, sourcedNets, voltageSources } = useElectricalStore.getState();
+    const sources = new Set(voltageSources ?? []);
     const { boards } = useSimulatorStore.getState();
     for (const board of boards) {
       const sim = getBoardSimulator(board.id) as
@@ -92,6 +94,19 @@ export function connectDigitalInputsToMcu(): () => void {
         const gpio = isStm32 ? stm32PinNameToLinear(pinName) : gpioFromPinName(pinName, board.boardKind);
         if (gpio < 0) continue;
         if (driven.has(gpio)) continue; // the MCU drives this pin (digitalWrite)
+        // A deck that still carries this pad's OWN source is stale: the pad
+        // was an output when the netlist was built and has since been reset
+        // (Stop, Reset) or released (pinMode(INPUT)). Its net solves at the
+        // level the pad itself last drove, and pushing that back in would
+        // make the firmware read its own ghost. Measured on the Grove relay
+        // example: Stop with the contact closed re-latched the relay and the
+        // motor ran at full speed with the board powered off. Forget the
+        // memory too, so the first honest solve after the rebuild is emitted
+        // even if it agrees with what was pushed before.
+        if (sources.has(`v_${sanitizeSpiceId(board.id)}_${sanitizeSpiceId(pinName)}`.toLowerCase())) {
+          lastLevel.delete(`${board.id}:${gpio}`);
+          continue;
+        }
         // A part that models this line ITSELF (an HC-SR04's ECHO pulse, a
         // DHT22's frame, an encoder's edges) owns it — see partPinOwnership.
         // The `sourcedNets` gate below cannot protect those: the moment the
@@ -116,12 +131,27 @@ export function connectDigitalInputsToMcu(): () => void {
         if (!sourcedNets.has(net)) continue;
         const v = nodeVoltages[net];
         if (v == null) continue;
+        // A number the solver could not produce is not a level. ngspice hands
+        // back NaN / Infinity for a node whose transient step never converged,
+        // and a circuit full of relay coils gives it plenty of chances: an
+        // ideal switch, a flyback diode and 20 mH is a stiff little system. A
+        // NaN fails both threshold tests, so it used to fall through to the
+        // `prev ?? false` below and every input pin on the board went LOW in
+        // the same pass — which reads exactly like several buttons pressed at
+        // once, out of nowhere, and recovering by itself (issue #333). Hold
+        // what the pin already had and wait for a solve that means something.
+        if (!Number.isFinite(v)) continue;
         const stateKey = `${board.id}:${gpio}`;
         const prev = lastLevel.get(stateKey);
         let next: boolean;
         if (v >= V_HIGH) next = true;
         else if (v <= V_LOW) next = false;
-        else next = prev ?? false; // inside the hysteresis band — hold
+        else if (prev !== undefined) next = prev; // inside the band — hold
+        // A node sitting in the undefined band with no history is not
+        // something to have an opinion about: real silicon reads it as
+        // whatever its own input stage decides, and inventing a LOW here
+        // pushed a falling edge into the guest that no circuit asked for.
+        else continue;
         if (prev === next) continue;
         lastLevel.set(stateKey, next);
         sim.setPinState(gpio, next);

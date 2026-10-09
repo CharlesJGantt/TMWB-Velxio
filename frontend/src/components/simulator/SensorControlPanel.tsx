@@ -8,9 +8,13 @@
 
 import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { type SensorControl, type SliderControl, LOG_SLIDER_STEPS, logSliderToValue, logValueToSlider, getSensorControlForComponent } from '../../simulation/sensorControlConfig';
+import { type SensorControl, type SliderControl, LOG_SLIDER_STEPS, logSliderToValue, logValueToSlider, getSensorControlForComponent, projectSensorValues, sliderInput, nearestOption } from '../../simulation/sensorControlConfig';
 import { useSimulatorStore } from '../../store/useSimulatorStore';
-import { dispatchSensorUpdate, getLastSensorValues } from '../../simulation/SensorUpdateRegistry';
+import {
+  dispatchSensorUpdate,
+  getLastSensorValues,
+  replayProjectSensorValues,
+} from '../../simulation/SensorUpdateRegistry';
 import './SensorControlPanel.css';
 
 interface SensorControlPanelProps {
@@ -53,23 +57,28 @@ export const SensorControlPanel: React.FC<SensorControlPanelProps> = ({
     .components.find((c) => c.id === componentId);
   const def = comp ? getSensorControlForComponent(comp) : undefined;
 
+  // The sensor's project values: what the user configured, with the panel
+  // defaults only for what the project leaves unset.
+  const project = comp && def ? projectSensorValues(comp, def) : {};
+
   // Local slider/button state — hydrated from the registry's last-known
   // values for this componentId (so reopening a sensor or switching between
   // two sensors of the same type shows each one's current state, not the
-  // previous panel's). Falls back to config defaults the first time a
-  // sensor is opened.
+  // previous panel's). Falls back to the project values the first time a
+  // sensor is opened, and after a Reset (sensorResetNonce remounts this).
   const [values, setValues] = useState<Record<string, number | boolean>>(() => {
     const cached = getLastSensorValues(componentId);
-    if (cached) return { ...(def?.defaultValues ?? {}), ...cached };
-    return def ? { ...def.defaultValues } : {};
+    return cached ? { ...project, ...cached } : { ...project };
   });
 
-  // Push defaults into simulation on first open for this sensor. Skipped
+  // First open for this sensor: make sure the simulation holds what the
+  // slider shows (a part without a project value runs on its own default).
+  // A replay, not a live move: nothing is written into the project. Skipped
   // when the sensor already has cached values — the simulation still holds
   // them, no need to clobber.
   useEffect(() => {
-    if (def && Object.keys(def.defaultValues).length > 0 && !getLastSensorValues(componentId)) {
-      dispatchSensorUpdate(componentId, def.defaultValues);
+    if (Object.keys(project).length > 0 && !getLastSensorValues(componentId)) {
+      replayProjectSensorValues(componentId, project);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [componentId]);
@@ -115,6 +124,50 @@ export const SensorControlPanel: React.FC<SensorControlPanelProps> = ({
     // Slider
     const sc = ctrl as SliderControl;
     const val = (values[sc.key] as number) ?? sc.defaultValue;
+
+    // A switch or a choice among named cases: the same control the property
+    // dialog shows for it, dispatching the same number the slider would.
+    const input = sliderInput(sc);
+    if (input.kind === 'toggle') {
+      const id = `sensor-ctl-${componentId}-${sc.key}`;
+      return (
+        <div key={sc.key} className="sensor-control-row">
+          <label className="sensor-control-label-wide" htmlFor={id}>
+            {sc.label}
+          </label>
+          <input
+            id={id}
+            type="checkbox"
+            className="sensor-check"
+            checked={Number(val) >= 0.5}
+            onChange={(e) => handleSlider(sc.key, e.target.checked ? '1' : '0')}
+          />
+        </div>
+      );
+    }
+    if (input.kind === 'choice') {
+      const id = `sensor-ctl-${componentId}-${sc.key}`;
+      const current = nearestOption(input.options, Number(val));
+      return (
+        <div key={sc.key} className="sensor-control-row">
+          <label className="sensor-control-label-wide" htmlFor={id}>
+            {sc.label}
+          </label>
+          <select
+            id={id}
+            className="sensor-select"
+            value={current ? String(current.value) : ''}
+            onChange={(e) => handleSlider(sc.key, e.target.value)}
+          >
+            {input.options.map((o) => (
+              <option key={o.value} value={String(o.value)}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+        </div>
+      );
+    }
     const displayVal = sc.formatValue ? sc.formatValue(val) : String(val);
     const isAxisKey = AXIS_KEYS.has(sc.key);
     // Log-scale sliders (illumination): the range input runs in POSITION

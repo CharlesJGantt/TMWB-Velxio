@@ -1,7 +1,9 @@
+import { useSimulatorStore } from '../../store/useSimulatorStore';
 import { PartSimulationRegistry } from './PartSimulationRegistry';
-import type { AnySimulator } from './PartSimulationRegistry';
+import { attachSpiDevice } from '../buses';
+import type { AnySimulator, PartSimulationLogic } from './PartSimulationRegistry';
 import { RP2040Simulator } from '../RP2040Simulator';
-import { getADC, setAdcVoltage, emitPropertyChange } from './partUtils';
+import { getADC, setAdcVoltage, emitPropertyChange, elementNumber } from './partUtils';
 import { registerSensorUpdate, unregisterSensorUpdate } from '../SensorUpdateRegistry';
 import { LOG_SLIDER_STEPS, logSliderToValue } from '../sensorControlConfig';
 
@@ -155,9 +157,12 @@ PartSimulationRegistry.register('photoresistor-sensor', {
 
     const unsubscribers: (() => void)[] = [];
 
-    // Inject initial mid-range voltage (simulate moderate light, ~500 lux)
+    // The project's illumination (the canvas copies properties.lux onto the
+    // element; the panel keeps it in step while running), 500 lux (2.5 V)
+    // when it sets none. This used to be 2.5 V whatever the project said.
+    const el = element as unknown as { lux?: unknown };
     if (pinAO !== null) {
-      setAdcVoltage(avrSimulator, pinAO, 2.5);
+      setAdcVoltage(avrSimulator, pinAO, (elementNumber(el.lux, 500) / 1000) * 5.0);
     }
 
     // Watch element's 'input' events in case the element supports it
@@ -194,6 +199,7 @@ PartSimulationRegistry.register('photoresistor-sensor', {
     // SensorControlPanel: lux 0–1000 → volts 0–5
     registerSensorUpdate(componentId, (values) => {
       if ('lux' in values) {
+        el.lux = values.lux;
         if (pinAO !== null) {
           setAdcVoltage(avrSimulator, pinAO, ((values.lux as number) / 1000) * 5.0);
         }
@@ -622,7 +628,7 @@ PartSimulationRegistry.register('buzzer', {
       if (onWhen !== null && off < onWhen + ATTACK + 0.002) off = onWhen + ATTACK + 0.002;
       if (off < ctx.currentTime + 0.003) off = ctx.currentTime + 0.003;
       try {
-        activeGain.gain.setValueAtTime(0.1, off);
+        activeGain.gain.setValueAtTime(dutyLevel, off);
         activeGain.gain.linearRampToValueAtTime(0, off + RELEASE);
         activeOsc.stop(off + RELEASE + 0.001);
       } catch {
@@ -631,6 +637,22 @@ PartSimulationRegistry.register('buzzer', {
       activeOsc = null;
       activeGain = null;
     }
+
+    /** How loud a square wave of this duty cycle is.
+     *
+     *  A passive buzzer is driven by the pin, and what it puts out is the
+     *  fundamental of that square wave — whose amplitude is sin(pi * duty).
+     *  Loudest at 50%, and fading to nothing as the duty approaches either
+     *  rail, where the pin is barely moving. So analogWrite() on a buzzer
+     *  changes the volume, which is what people use it for, and tone() (a
+     *  square wave at 50%) is unaffected: sin(pi/2) is 1.
+     *
+     *  Duty is only known on the PWM path; a tone driven by plain HIGH/LOW
+     *  edges passes nothing and gets the full level. */
+    const PEAK = 0.1;
+    let dutyLevel = PEAK;
+    const levelForDuty = (duty: number) =>
+      PEAK * Math.sin(Math.PI * Math.min(1, Math.max(0, duty)));
 
     function startTone(freq: number, timeMs?: number) {
       ensureCtx();
@@ -649,7 +671,7 @@ PartSimulationRegistry.register('buzzer', {
       osc.frequency.value = freq; // fixed for the life of this note (no live change)
       const g = ctx.createGain();
       g.gain.setValueAtTime(0, when);
-      g.gain.linearRampToValueAtTime(0.1, when + ATTACK);
+      g.gain.linearRampToValueAtTime(dutyLevel, when + ATTACK);
       osc.connect(g);
       g.connect(ctx.destination);
       osc.start(when);
@@ -686,6 +708,24 @@ PartSimulationRegistry.register('buzzer', {
     // Poll via PWM duty cycle on the buzzer pin
     const unsubscribers: (() => void)[] = [];
 
+    // Stop means silence. A buzzer makes sound because a pin is driving it, so
+    // when the board stops there is nothing left to drive it — but parts
+    // deliberately survive a Stop (a display keeps its picture, an I2C part
+    // keeps its state), so nothing was ending the note: the last tone played
+    // on for ever and only Reset, which remounts the part and runs its
+    // cleanup, could silence it (issue #351).
+    //
+    // `every` rather than `some`: with two boards on the canvas, stopping one
+    // must not cut off a buzzer the other one is still driving.
+    let wasRunning = useSimulatorStore.getState().boards.some((b) => b.running);
+    unsubscribers.push(
+      useSimulatorStore.subscribe((state) => {
+        const running = state.boards.some((b) => b.running);
+        if (wasRunning && !running) stopTone();
+        wasRunning = running;
+      }),
+    );
+
     if (pinSIG !== null && pinManager) {
       unsubscribers.push(
         pinManager.onPwmChange(pinSIG, (_: number, dc: number, timeMs?: number) => {
@@ -693,6 +733,7 @@ PartSimulationRegistry.register('buzzer', {
           const cpu = (avrSimulator as any).cpu;
           if (dc > 0) {
             const freq = cpu ? getFrequency(cpu) : 440;
+            dutyLevel = levelForDuty(dc);
             startTone(Math.max(20, Math.min(20000, freq)), timeMs);
           } else {
             stopTone(timeMs);
@@ -946,12 +987,15 @@ PartSimulationRegistry.register('lcd2002', createLcdSimulation(20, 2));
 // ─── ILI9341 TFT Display (SPI) ───────────────────────────────────────────────
 
 /**
- * ILI9341 TFT display simulation via hardware SPI.
+ * ILI9341 TFT display simulation.
  *
- * Intercepts writes to SPDR (via AVRSPI) and decodes ILI9341 commands:
+ * A write-only device on the board's SPI fabric (it registers its own SCK /
+ * MOSI / MISO / CS pins and is clocked only while its chip select is active).
+ * It decodes ILI9341 commands:
  *   - 0x2A CASET  – set column address window
  *   - 0x2B PASET  – set page (row) address window
- *   - 0x2C RAMWR  – stream RGB-565 pixel data
+ *   - 0x2C RAMWR  – rewind the cursor to the window's start and stream
+ *                    RGB-565 pixel data
  *   - 0x36 MADCTL – memory access control (rotation MV / MX / MY bits)
  *   - 0x01 SWRESET – clear display
  *   - All others are silently accepted (DISPON, COLMOD, …)
@@ -966,20 +1010,12 @@ PartSimulationRegistry.register('lcd2002', createLcdSimulation(20, 2));
  *
  * DC/RS pin: LOW = command byte, HIGH = data bytes.
  */
-const ili9341Simulation = {
-  attachEvents: (element, simulator, getArduinoPinHelper) => {
+const ili9341Simulation: PartSimulationLogic = {
+  attachEvents: (element, simulator, getArduinoPinHelper, componentId) => {
     const el = element as any;
     const pinManager = (simulator as any).pinManager;
-    // Generic .spi accessor — every simulator (AVR, RP2040, ESP32 family)
-    // exposes a SpiBusLike object via this name (see frontend/src/simulation/
-    // SpiBus.ts). Single-listener channel: assign to spi.onByte and
-    // chain any prior handler in our cleanup.
-    const spi = (simulator as any).spi as
-      | { onByte: ((mosi: number) => void) | null;
-          completeTransfer?: (miso: number) => void }
-      | undefined;
 
-    if (!pinManager || !spi) return () => {};
+    if (!pinManager) return () => {};
 
     // ── Canvas setup ──────────────────────────────────────────────────
     const SCREEN_W = 240;
@@ -1115,12 +1151,23 @@ const ili9341Simulation = {
         // Portrait (rotations 0 or 2)
         physX = madMY ? (SCREEN_W - 1) - curX : curX;
         physY = madMY ? (SCREEN_H - 1) - curY : curY;
-      } else if (!madMX && !madMY) {
-        // Landscape rotation 1: m = MV | BGR. (curY, 319 - curX)
+      } else if (!madMX) {
+        // Landscape, turned one way: MV with the column order left alone.
+        // Adafruit's rotation 1 (m = MV | BGR) and LovyanGFX's rotation 3
+        // (m = MV | MY | ML) both land here.
         physX = curY;
         physY = (SCREEN_H - 1) - curX;
       } else {
-        // Landscape rotation 3: m = MX | MY | MV | BGR. (239 - curY, curX)
+        // Landscape, turned the other way: MV with the column order reversed.
+        // Adafruit's rotation 3 (m = MX | MY | MV | BGR) and LovyanGFX's
+        // rotation 1 (m = MV | MX | MH).
+        //
+        // Asking "neither mirror bit" instead of "is MX set" is an
+        // Adafruit-shaped question: it always sets MX and MY together, so its
+        // pair agrees. LovyanGFX sets ONE of them per landscape rotation, so
+        // both of its landscapes fell in the same branch and rendered
+        // identically — and touch, which a driver rotates by the rotation the
+        // panel is in, then disagreed with the picture (issue #338).
         physX = (SCREEN_W - 1) - curY;
         physY = curX;
       }
@@ -1160,6 +1207,18 @@ const ili9341Simulation = {
       dataBytes = [];
       inRamWrite = cmd === 0x2c;
       pixelByteCount = 0;
+
+      // RAMWR (2Ch) puts the frame-memory pointer back at the start of the
+      // window (datasheet 8.2.22 Memory Write): the next pixel lands on
+      // (SC, SP) whether or not CASET/PASET were sent again. Without this the
+      // cursor only ever moved on a CASET/PASET, so a driver that keeps the
+      // window and re-sends RAMWR alone (a second fillScreen of the same
+      // area, TFT_eSPI skipping an unchanged setAddrWindow) went on writing
+      // past rowEnd and drew nothing at all.
+      if (cmd === 0x2c) {
+        curX = colStart;
+        curY = rowStart;
+      }
 
       if (cmd === 0x01) {
         // SWRESET – clear framebuffer + reset MADCTL to defaults
@@ -1219,25 +1278,57 @@ const ili9341Simulation = {
       }
     };
 
-    // ── Intercept SPI (board-agnostic) ────────────────────────────────
-    // Single hook regardless of board kind: every simulator's `.spi`
-    // exposes the same shape — settable onByte handler + optional
-    // completeTransfer to drive MISO. AVR and RP2040 actually use
-    // completeTransfer; ESP32 ignores it (worker drives MISO via
-    // its own _spi_response global).
-    const prevOnByte = spi.onByte;
-    spi.onByte = (value: number) => {
+    // ── On the SPI bus ────────────────────────────────────────────────
+    // The panel is a write-only sink: it never drives MISO, so it answers
+    // null and the fabric resolves the line. The fabric hands it a frame
+    // only while its OWN chip select is active, which is what a real panel
+    // does and what the chain never did: a card or a touch controller on the
+    // same SCK/MOSI used to paint its traffic as pixels (#343).
+    //
+    // CS rising deliberately does NOT end a RAM write. On the chip the frame
+    // memory pointer and the active command survive CSX, which is what every
+    // Adafruit driver relies on: setAddrWindow + RAMWR go out in one
+    // transaction and the pixels in the next (pushColor). Only a new RAMWR
+    // moves the cursor.
+    const owner = componentId || (el?.id as string) || 'ili9341';
+    const feed = (value: number) => {
       if (!dcState) processCommand(value);
-      else          processData(value);
-      // Idle-byte response — the typical ILI9341 driver writes only,
-      // so any value works. 0xff matches what the prior AVR path
-      // returned to keep behaviour stable.
-      spi.completeTransfer?.(0xff);
+      else processData(value);
     };
+    const handle = attachSpiDevice(
+      { owner, pins: { sck: 'SCK', mosi: 'MOSI', miso: 'MISO', cs: 'CS' } },
+      {
+        // The panel's SDO leg is real and stays declared, so a wire on it is
+        // checked like any other. This model implements no read command
+        // (RDDID, RDDST, RAMRD), so that leg never leaves high impedance, and
+        // saying so is what keeps a TFT sharing its bus with a card or a
+        // touch controller from being reported as a responder the QEMU
+        // worker cannot host. A model that grows reads drops this, and then
+        // needs a portable model of its own for the remote lanes.
+        writeOnly: true,
+        transfer: (value: number) => {
+          feed(value);
+          return null;
+        },
+        transferBlock: (bytes: Uint8Array) => {
+          for (let i = 0; i < bytes.length; i++) feed(bytes[i]);
+        },
+        boardReset: () => {
+          // The MCU rebooted: the next byte on the wire is a fresh command,
+          // so the half-read parameter list and the half-read pixel go. The
+          // window, the rotation and the picture are the panel's own and
+          // stay, as they do on a board whose reset button is pressed.
+          currentCmd = -1;
+          dataBytes = [];
+          inRamWrite = false;
+          pixelByteCount = 0;
+        },
+      },
+    );
 
     // ── Cleanup ───────────────────────────────────────────────────────
     return () => {
-      spi.onByte = prevOnByte;
+      handle.dispose();
       if (idleTimerId !== null) clearTimeout(idleTimerId);
       el.removeEventListener('canvas-ready', onCanvasReady);
       unsubscribers.forEach((u) => u());

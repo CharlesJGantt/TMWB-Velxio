@@ -44,6 +44,7 @@
  */
 
 import { getTabSessionId } from './Esp32Bridge';
+import type { RemoteSpiMapEntry } from './buses/registry';
 
 /**
  * What the board publishes to the backend about its bus (`pi_bus_topology`).
@@ -52,9 +53,52 @@ import { getTabSessionId } from './Esp32Bridge';
  * the device has to be asked each time.
  */
 export interface PiBusTopology {
-  version: 1;
-  i2c: Array<{ bus: number; addr: number; regs: string | null }>;
-  spi: { attached: boolean };
+  /**
+   * 2: this tab answers a numbered write (a request line that ends in
+   * `#<seq>`) with the device's registers and that number. The backend only
+   * numbers its writes, and only holds a copy back until they are answered,
+   * for a tab that says so; a tab that published version 1 gets neither.
+   */
+  version: 2;
+  /**
+   * `ask_writes`: a device that can NAK while present (I2cTarget.mayNak).
+   * The backend asks this tab for the ACK of its writes instead of giving it
+   * itself, so a NAK reaches the guest. Absent = the backend ACKs.
+   *
+   * `seq`: the number of the last write the backend sent to this device that
+   * `regs` includes. Absent = none was numbered yet.
+   *
+   * `volatile_reads`: with `regs`, the registers a read changes or time does
+   * (I2cTarget.volatileReads). The backend asks this tab for every read that
+   * touches one instead of answering from its copy. Absent = none; a backend
+   * from before the field answers them from its copy, as it always did.
+   *
+   * `pointer_stays`: with `regs`, the registers the chip's pointer does not
+   * move past (I2cTarget.pointerStays); the backend's pointer stays there
+   * too. Absent = none.
+   *
+   * `pointer_wraps_after`: with `regs`, the register after which the chip's
+   * pointer wraps to 0x00 (I2cTarget.pointerWrapsAfter): 0x3F on a DS1307,
+   * 0x12 on a DS3231. Absent = after 0xFF, which is also what a backend from
+   * before the field does.
+   */
+  i2c: Array<{
+    bus: number;
+    addr: number;
+    regs: string | null;
+    ask_writes?: true;
+    seq?: number;
+    volatile_reads?: number[];
+    pointer_stays?: number[];
+    pointer_wraps_after?: number;
+  }>;
+  /**
+   * `responders` are the SPI devices with a portable model (the bus map an
+   * ESP32 or STM32 worker gets, entry for entry): the backend runs them beside
+   * the guest, by chip enable, and answers their transfers without asking this
+   * tab (project board-buses-2026-09, F4). Absent = none.
+   */
+  spi: { attached: boolean; responders?: RemoteSpiMapEntry[] };
 }
 
 const API_BASE = (): string => {
@@ -106,6 +150,13 @@ export class RaspberryPi3Bridge {
   /** Bytes the guest wrote to its HEADER UART (not the console): another
    * board wired to those pads is the destination. Decoded text. */
   onUartTx: ((text: string) => void) | null = null;
+  /**
+   * The same bytes, raw, for the board's UART controller port (the
+   * PiBridgeShim owns this slot; project board-buses-2026-09, F6). Its own
+   * slot rather than a chain on onUartTx: a byte above 0x7f does not survive
+   * the text decode, and a fingerprint reader's frames are made of them.
+   */
+  onUartTxBytes: ((bytes: Uint8Array) => void) | null = null;
   /** Guest PWM activity (PWM_START / PWM_CHANGE / PWM_STOP). Overlay boards
    * use it for built-in buzzers/speakers. */
   onGpioPwm:
@@ -256,11 +307,9 @@ export class RaspberryPi3Bridge {
           const b64 = (msg.data.data as string) ?? '';
           if (b64) {
             try {
-              this.onUartTx?.(
-                new TextDecoder().decode(
-                  Uint8Array.from(atob(b64), (ch) => ch.charCodeAt(0)),
-                ),
-              );
+              const raw = Uint8Array.from(atob(b64), (ch) => ch.charCodeAt(0));
+              this.onUartTxBytes?.(raw);
+              this.onUartTx?.(new TextDecoder().decode(raw));
             } catch {
               /* malformed payload — never kill the session over it */
             }
@@ -480,9 +529,21 @@ export class RaspberryPi3Bridge {
     this._send({ type: 'pi_bus_topology', data: topology });
   }
 
-  /** A register-file device's registers changed (`pi_bus_regs`). */
-  sendBusRegs(bus: number, address: number, regsHex: string): void {
-    this._send({ type: 'pi_bus_regs', data: { bus, addr: address, regs: regsHex } });
+  /** A hosted SPI responder's live inputs changed (`pi_bus_attrs`): the
+   *  backend applies them to the model it runs for `owner`. */
+  sendBusAttrs(owner: string, attrs: Record<string, number>): void {
+    this._send({ type: 'pi_bus_attrs', data: { owner, attrs } });
+  }
+
+  /**
+   * A register-file device's registers (`pi_bus_regs`). `seq` is the number of
+   * the last write the backend sent to the device that these registers
+   * include, when it numbered one: the backend tells by it a push computed
+   * before a guest's write from the one that answers that write. A backend
+   * that numbers nothing never reads it.
+   */
+  sendBusRegs(bus: number, address: number, regsHex: string, seq?: number): void {
+    this._send({ type: 'pi_bus_regs', data: { bus, addr: address, regs: regsHex, seq } });
   }
 
   private _send(payload: unknown): void {

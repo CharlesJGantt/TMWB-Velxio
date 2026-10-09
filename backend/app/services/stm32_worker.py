@@ -6,7 +6,8 @@ Loads libqemu-arm in its own process (same model as esp32_worker.py) and drives
 an STM32 machine from the lcgamboa fork through the PICSimLab bridge
 (hw/arm/stm32_picsimlab.c). Supports GPIO + UART TX + I2C + SPI. The I2C/SPI
 device models (sensors + displays) are reused verbatim from the ESP32 worker's
-slave modules (esp32_i2c_slaves.py, esp32_spi_slaves.py).
+slave module (esp32_i2c_slaves.py); every SPI device is the tab's, fed
+from the spi_batch stream.
 
 Excluded (ESP32-specific): WiFi, RMT/WS2812, LEDC, GPIO matrix, camera, WASM
 custom chips, DHT22/HC-SR04 sync handlers.
@@ -17,7 +18,7 @@ stdin  line 1 : JSON config {"lib_path","firmware_b64","machine","sensors"}
 stdin  line 2+: JSON commands (set_pin, uart_send, sensor_attach/update/detach,
                 set_i2c_response, set_spi_response, stop)
 stdout        : JSON event lines (system, gpio_change, gpio_dir, uart_tx,
-                i2c_trace, spi_batch, spi_event, epaper_update, error)
+                i2c_trace, spi_batch, spi_event, error)
 stderr        : debug logs
 """
 import base64
@@ -33,7 +34,9 @@ try:
     from app.services.esp32_i2c_slaves import (
         MPU6050Slave as _MPU6050Slave, BMP280Slave as _BMP280Slave,
         DS1307Slave as _DS1307Slave, DS3231Slave as _DS3231Slave,
-        I2CWriteSink as _I2CWriteSink, ProxySlave as _ProxySlave,
+        I2CWriteSink as _I2CWriteSink, find_build_times as _find_build_times,
+        rtc_slave as _rtc_slave, bmp280_slave as _bmp280_slave,
+        mpu6050_slave as _mpu6050_slave,
     )
 except ImportError:
     import importlib.util as _ilu, pathlib as _pl, sys as _sys
@@ -44,23 +47,11 @@ except ImportError:
     _spec.loader.exec_module(_mod)                 # type: ignore[union-attr]
     _MPU6050Slave = _mod.MPU6050Slave; _BMP280Slave = _mod.BMP280Slave
     _DS1307Slave = _mod.DS1307Slave; _DS3231Slave = _mod.DS3231Slave
-    _I2CWriteSink = _mod.I2CWriteSink; _ProxySlave = _mod.ProxySlave
-
-# ── SPI slaves (ePaper) ───────────────────────────────────────────────────────
-try:
-    from app.services.esp32_spi_slaves import (
-        Ssd168xEpaperSlave as _Ssd168xEpaperSlave,
-        Uc8159cEpaperSlave as _Uc8159cEpaperSlave,
-    )
-except ImportError:
-    import importlib.util as _ilu, pathlib as _pl, sys as _sys
-    _spec = _ilu.spec_from_file_location(
-        'esp32_spi_slaves', _pl.Path(__file__).parent / 'esp32_spi_slaves.py')
-    _mod = _ilu.module_from_spec(_spec)            # type: ignore[arg-type]
-    _sys.modules['esp32_spi_slaves'] = _mod
-    _spec.loader.exec_module(_mod)                 # type: ignore[union-attr]
-    _Ssd168xEpaperSlave = _mod.Ssd168xEpaperSlave
-    _Uc8159cEpaperSlave = _mod.Uc8159cEpaperSlave
+    _I2CWriteSink = _mod.I2CWriteSink
+    _find_build_times = _mod.find_build_times
+    _rtc_slave = _mod.rtc_slave
+    _bmp280_slave = _mod.bmp280_slave
+    _mpu6050_slave = _mod.mpu6050_slave
 
 _stdout_lock = threading.Lock()
 
@@ -129,6 +120,19 @@ def main() -> None:
 
     lib.qemu_picsimlab_set_pin.restype = None
     lib.qemu_picsimlab_set_pin.argtypes = [ctypes.c_int, ctypes.c_int]
+    # The guest's own clock, for the parts that keep time (the MPU-6050's
+    # sample period). A libqemu that does not export it leaves them without
+    # one, and they count the events they are sent instead.
+    try:
+        _qemu_clock_get_ns = lib.qemu_clock_get_ns
+        _qemu_clock_get_ns.restype = ctypes.c_int64
+        _qemu_clock_get_ns.argtypes = [ctypes.c_int]
+        _QEMU_CLOCK_VIRTUAL = 1  # enum QEMUClockType, qemu/timer.h
+
+        def _guest_clock_ns() -> int:
+            return int(_qemu_clock_get_ns(_QEMU_CLOCK_VIRTUAL))
+    except AttributeError:
+        _guest_clock_ns = None
     try:
         _shutdown_request = lib.qemu_system_shutdown_request
         _shutdown_request.restype = None
@@ -146,6 +150,21 @@ def main() -> None:
         _emit({'type': 'error', 'message': f'Firmware decode error: {exc}'})
         os._exit(1)
 
+    # When this firmware was built, for a clock chip the sketch sets to
+    # __DATE__ and __TIME__ (esp32_i2c_slaves, decision D7 of project
+    # i2c-model-fidelity-2026-09). Read from the ELF the first time a sketch
+    # sets a clock.
+    _build_times: list = []
+
+    def _firmware_build_times() -> tuple:
+        if not _build_times:
+            try:
+                _build_times.append(tuple(_find_build_times(fw_bytes)))
+            except Exception as e:  # noqa: BLE001
+                _log(f'build time scan failed: {e!r}')
+                _build_times.append(())
+        return _build_times[0]
+
     args_list = [b'qemu', b'-M', machine.encode(), b'-nographic',
                  b'-kernel', firmware_path.encode()]
     argc = len(args_list)
@@ -162,8 +181,6 @@ def main() -> None:
     _spi_buf_lock = threading.Lock()
     _SPI_BATCH_FLUSH_AT = 4096
     _SPI_BATCH_PERIOD_S = 0.05
-    _epaper_slaves: dict = {}
-    _epaper_state: dict = {}
     _pin_state: dict = {}
     _sensors: dict = {}
     _sensors_lock = threading.Lock()
@@ -172,40 +189,25 @@ def main() -> None:
         """Instantiate the right I2C/SPI slave for a sensor descriptor."""
         stype = s.get('sensor_type', '')
         if stype == 'mpu6050':
-            addr = int(s.get('addr', 0x68)); _i2c_slaves[addr] = _MPU6050Slave(addr)
+            addr = _MPU6050Slave.address_of(s)
+            # The part's compiled model when the record carries it
+            # (buses/models/mpu6050.c), the twin otherwise, on the guest's
+            # clock and already at the panel's values.
+            _i2c_slaves[addr] = _mpu6050_slave(s, now_ns=_guest_clock_ns)
         elif stype == 'bmp280':
-            addr = int(s.get('addr', 0x76)); sl = _BMP280Slave(addr)
-            if 'temperature' in s: sl.update(float(s['temperature']), sl._press_hpa)
-            if 'pressure' in s: sl.update(sl._temp_c, float(s['pressure']))
-            _i2c_slaves[addr] = sl
+            # The part's compiled model when the record carries it
+            # (buses/models/bmp280.c), the twin otherwise, at the panel's values.
+            addr = int(s.get('addr', 0x76))
+            _i2c_slaves[addr] = _bmp280_slave(s)
         elif stype in ('ds1307', 'ds3231'):
             addr = int(s.get('addr', 0x68))
-            _i2c_slaves[addr] = _DS3231Slave() if stype == 'ds3231' else _DS1307Slave()
+            # The record carries the tab's clock, and the panel's temperature
+            # for the DS3231, so the first read is already what the tab's
+            # model shows.
+            _i2c_slaves[addr] = _rtc_slave(stype, s, _firmware_build_times)
         elif stype in ('ssd1306', 'pcf8574'):
-            addr = int(s.get('addr', 0x3C if stype == 'ssd1306' else 0x27))
-            _i2c_slaves[addr] = _I2CWriteSink(addr, _emit)
-        elif stype == 'epaper-ssd168x':
-            comp = str(s.get('component_id', 'epaper'))
-            w = int(s.get('width', 200)); h = int(s.get('height', 200))
-            refresh = int(s.get('refresh_ms', 50))
-            fam = str(s.get('controller_family', 'ssd168x'))
-
-            def _on_flush(frame, _c=comp, _w=w, _h=h, _r=refresh):
-                try:
-                    b64 = base64.b64encode(frame.pixels).decode('ascii')
-                except Exception:
-                    return
-                _emit({'type': 'epaper_update', 'data': {
-                    'component_id': _c, 'width': _w, 'height': _h,
-                    'frame_b64': b64, 'refresh_ms': _r}})
-            slave = (_Uc8159cEpaperSlave if fam == 'uc8159c' else _Ssd168xEpaperSlave)(
-                component_id=comp, width=w, height=h, on_flush=_on_flush)
-            _epaper_slaves[comp] = slave
-            _epaper_state[comp] = {
-                'slave': slave, 'dc_pin': int(s.get('dc_pin', -1)),
-                'cs_pin': int(s.get('cs_pin', -1)), 'rst_pin': int(s.get('rst_pin', -1)),
-                'cs_low': False, 'dc_high': False}
-
+            sink = _I2CWriteSink.from_record(stype, s, _emit)
+            _i2c_slaves[sink.addr] = sink
     # ── Callbacks (QEMU thread) ───────────────────────────────────────────────
     def _on_pin_change(pin, value):
         if _stopped.is_set():
@@ -213,14 +215,6 @@ def main() -> None:
         pin = int(pin); value &= 1
         _pin_state[pin] = value
         _emit({'type': 'gpio_change', 'pin': pin, 'state': value})
-        # ePaper DC/CS/RST tracking (CS active-low, RST clears on low).
-        for st in _epaper_state.values():
-            if pin == st['dc_pin']:
-                st['dc_high'] = bool(value)
-            elif pin == st['cs_pin']:
-                st['cs_low'] = (value == 0)
-            elif pin == st['rst_pin'] and value == 0:
-                st['slave'].reset()
 
     def _on_dir_change(pin, direction):
         if _stopped.is_set() or pin < 0:
@@ -267,15 +261,6 @@ def main() -> None:
     def _on_spi_event(bus_id, event):
         op = event & 0xFF
         mosi = (event >> 8) & 0xFF
-        # ePaper panels: feed every byte to the active (CS low) slave.
-        if _epaper_state and op == 0x00:
-            for st in _epaper_state.values():
-                if st['cs_low']:
-                    try:
-                        st['slave'].feed(mosi, st['dc_high'])
-                    except Exception as e:
-                        _log(f'[epaper] {e!r}')
-            return 0xFF
         resp = _spi_response[0]
         if _stopped.is_set():
             return resp
@@ -410,18 +395,19 @@ def main() -> None:
                     slave = _i2c_slaves.get(addr)
                     try:
                         if stype == 'bmp280' and slave is not None:
-                            slave.update(float(rec.get('temperature', 25.0)),
-                                         float(rec.get('pressure', 1013.25)))
+                            # Only what this update names, as for the MPU-6050.
+                            slave.update(**cmd)
                         elif stype == 'mpu6050' and slave is not None and hasattr(slave, 'update'):
-                            slave.update(accel_x=float(rec.get('accelX', 0)),
-                                         accel_y=float(rec.get('accelY', 0)),
-                                         accel_z=float(rec.get('accelZ', 1)),
-                                         gyro_x=float(rec.get('gyroX', 0)),
-                                         gyro_y=float(rec.get('gyroY', 0)),
-                                         gyro_z=float(rec.get('gyroZ', 0)),
-                                         temp=float(rec.get('temp', 25.0)))
-                        elif stype in ('ds3231',) and slave is not None and hasattr(slave, 'update'):
-                            slave.update(float(rec.get('temperature', 25.0)))
+                            # Only what this update names: a value it leaves
+                            # out stays where the record or an earlier update
+                            # put it.
+                            slave.update(**cmd)
+                        elif stype in ('ds1307', 'ds3231') and slave is not None:
+                            # Only what this update names: the temperature
+                            # the slider moved to, or the tab's clock sent
+                            # again. This branch asked for an update() the
+                            # twin did not have, and never ran.
+                            slave.update(**cmd)
                     except Exception as e:
                         _log(f'sensor_update failed: {e!r}')
         elif c == 'sensor_detach':

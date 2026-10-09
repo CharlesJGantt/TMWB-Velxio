@@ -19,8 +19,9 @@
 
 import { PartSimulationRegistry } from './PartSimulationRegistry';
 import { requestLine, releaseLineGap, recordPartGap } from '../line/requestLine';
-import { setAdcVoltage, emitPropertyChange, analogRailVolts, guestMillis } from './partUtils';
+import { setAdcVoltage, emitPropertyChange, analogRailVolts, guestMillis, elementNumber } from './partUtils';
 import { registerSensorUpdate, unregisterSensorUpdate } from '../SensorUpdateRegistry';
+import { sensorControlDefault } from '../sensorControlConfig';
 import { useSimulatorStore } from '../../store/useSimulatorStore';
 
 // ─── Tilt Switch ─────────────────────────────────────────────────────────────
@@ -79,7 +80,11 @@ PartSimulationRegistry.register('tilt-switch', {
  * SPICE path already used the board's rail, so the two only agreed on AVR.
  */
 PartSimulationRegistry.register('ntc-temperature-sensor', {
-  attachEvents: (_element, simulator, getArduinoPinHelper, componentId) => {
+  attachEvents: (element, simulator, getArduinoPinHelper, componentId) => {
+    // The project's temperature arrives on the element (the canvas copies
+    // properties onto it); the panel keeps the element in step while running,
+    // so a re-attach (Run after a rebuild, Reset) starts from the right value.
+    const el = element as unknown as { temperature?: unknown };
     const pin = getArduinoPinHelper('OUT');
 
     const NTC_R0 = 10_000;
@@ -91,11 +96,14 @@ PartSimulationRegistry.register('ntc-temperature-sensor', {
       return Math.max(0, Math.min(vcc, vcc * (rNtc / (rNtc + R_PULL))));
     };
 
-    // Room temperature default
-    if (pin !== null) setAdcVoltage(simulator, pin, tempToVolts(25));
+    // The project's temperature, room temperature when it sets none. This
+    // used to be 25 C whatever the project said, while the SPICE path read
+    // the property: the two disagreed on any NTC set to something else.
+    if (pin !== null) setAdcVoltage(simulator, pin, tempToVolts(elementNumber(el.temperature, 25)));
 
     registerSensorUpdate(componentId, (values) => {
       if ('temperature' in values) {
+        el.temperature = values.temperature;
         if (pin !== null) {
           setAdcVoltage(simulator, pin, tempToVolts(values.temperature as number));
         }
@@ -137,7 +145,8 @@ PartSimulationRegistry.register('photodiode', {
 
 /**
  * Gas sensor — injects analog voltage on AOUT.
- * Default 1.5V (clean air / low gas). SensorControlPanel slider adjusts level (0–1023).
+ * Starts at the panel's default gas level (100 of 1023, about 0.49 V: clean
+ * air). SensorControlPanel slider adjusts level (0–1023).
  * Higher value → higher voltage (more gas detected).
  */
 PartSimulationRegistry.register('gas-sensor', {
@@ -151,9 +160,10 @@ PartSimulationRegistry.register('gas-sensor', {
 
     const unsubscribers: (() => void)[] = [];
 
-    // Inject baseline analog voltage (1.5V ≈ clean air / low gas)
+    // Baseline analog voltage: the panel's default gas level (100 of 1023,
+    // clean air), not a voltage of this part's own.
     if (pinAOUT !== null) {
-      setAdcVoltage(simulator, pinAOUT, 1.5);
+      setAdcVoltage(simulator, pinAOUT, (sensorControlDefault('gas-sensor', 'gasLevel', 100) / 1023) * 5.0);
     }
 
     // DOUT from Arduino → threshold LED indicator
@@ -192,7 +202,8 @@ PartSimulationRegistry.register('gas-sensor', {
 
 /**
  * Flame sensor — injects analog voltage on AOUT.
- * Default 4.5V (no flame). SensorControlPanel slider: 0 = no flame (high V),
+ * Starts at the panel's default intensity (0: no flame, 5 V). SensorControlPanel
+ * slider: 0 = no flame (high V),
  * 1023 = intense flame (low V).
  */
 PartSimulationRegistry.register('flame-sensor', {
@@ -206,8 +217,14 @@ PartSimulationRegistry.register('flame-sensor', {
 
     const unsubscribers: (() => void)[] = [];
 
+    // No flame = high voltage: the panel's default intensity (0), mapped the
+    // way the slider maps it below.
     if (pinAOUT !== null) {
-      setAdcVoltage(simulator, pinAOUT, 4.5); // no flame = high voltage
+      setAdcVoltage(
+        simulator,
+        pinAOUT,
+        5.0 - (sensorControlDefault('flame-sensor', 'intensity', 0) / 1023) * 5.0,
+      );
     }
 
     if (pinDOUT !== null && pinManager) {
@@ -229,7 +246,7 @@ PartSimulationRegistry.register('flame-sensor', {
 
     registerSensorUpdate(componentId, (values) => {
       if ('intensity' in values && pinAOUT !== null) {
-        // 0 = no flame → high voltage (4.5V); 1023 = flame → low voltage (0.2V)
+        // 0 = no flame → high voltage (5 V); 1023 = flame → low voltage (0 V)
         const volts = 5.0 - ((values.intensity as number) / 1023) * 5.0;
         setAdcVoltage(simulator, pinAOUT, volts);
       }
@@ -661,6 +678,15 @@ export function createNeopixelDecoder(
   // 2/10 under rp2350js. An absolute threshold is right for exactly one of
   // those three and silently reads 0x00 or 0xFF for the others.
   //
+  // WHERE the ratio is cut matters as much. The pixel samples the line a fixed
+  // time after the rising edge (about 0.48 us: T0H is at most 380 ns, T1H at
+  // least 580 ns), so a '1' only has to be high past that point, not for most
+  // of the bit. Cutting at one half read FastLED's WS2811 and WS2813 as black:
+  // their '1' is 640 ns high and 640 ns low, exactly half, ten cycles of twenty
+  // on an AVR (measured on velxio.dev, 2026-10-05; WS2811 is the default chip
+  // of FastLED's DemoReel100). The cut is 5/12 of the bit: above the longest
+  // '0' any driver emits (1/3) and below the shortest '1' (1/2).
+  //
   // Seeded from the nominal 1.25 us bit period so the very first edge pair of a
   // run has something to compare against; every completed bit replaces it with
   // what this board actually produces.
@@ -688,6 +714,9 @@ export function createNeopixelDecoder(
   // FIRST bit of a frame, so the last bit is never left pending and no pixel
   // is dropped at the end of a run.
   let pendingHigh = -1;
+
+  /** The bit a pixel reads from a high of `highDur`, against this board's bit period. */
+  const bitOf = (highDur: number): number => (highDur * 12 > periodRef * 5 ? 1 : 0);
 
   /** Fold one decoded bit into the frame, emitting a pixel every 24. */
   const pushBit = (bit: number) => {
@@ -718,7 +747,7 @@ export function createNeopixelDecoder(
         else if (lastHighDur > 0) periodRef = lastHighDur + lowDur;
       }
       if (pendingHigh >= 0) {
-        pushBit(pendingHigh * 2 > periodRef ? 1 : 0);
+        pushBit(bitOf(pendingHigh));
         pendingHigh = -1;
       }
       if (isLatch) {
@@ -741,7 +770,7 @@ export function createNeopixelDecoder(
         // warning in attachWs2812Part tell the user something real.
         if (periodRef > 0 && (highDur > 0 || lastHighDur > 0)) {
           if (lastHighDur === 0) pendingHigh = highDur; // frame's first bit
-          else pushBit(highDur * 2 > periodRef ? 1 : 0);
+          else pushBit(bitOf(highDur));
         }
         lastHighDur = highDur;
       }

@@ -54,6 +54,18 @@ export interface CompileResult {
   /** { header: [candidate library display names] } — single-candidate
    * entries are safe to auto-declare (see utils/libraryManifest.ts). */
   manifest_suggested_libraries?: Record<string, string[]> | null;
+  /** Stable class of the failure, from the backend's own classifier. Absent
+   * on success. `core_install_failed` is the build server's problem: editing
+   * the sketch cannot fix it, and a caller that retries the same build is
+   * doing the right thing. */
+  error_kind?:
+    | 'missing_library'
+    | 'core_install_failed'
+    | 'linker_error'
+    | 'syntax_error'
+    | 'compile_error'
+    | 'unknown'
+    | null;
 }
 
 interface CompileStartResponse {
@@ -236,6 +248,18 @@ export async function compileCode(
   onProgress?: CompileProgress,
   extras?: CompileExtras,
 ): Promise<CompileResult> {
+  // Overlay seam: a project that ships a prebuilt image instead of sources the
+  // server can build returns it here. No provider in OSS builds -> null.
+  const prebuilt = await (
+    window as {
+      __velxio_prebuilt_firmware__?: (
+        files: SketchFile[],
+        board: string,
+      ) => Promise<CompileResult | null>;
+    }
+  ).__velxio_prebuilt_firmware__?.(files, board);
+  if (prebuilt) return prebuilt;
+
   console.log('Sending compilation request to:', `${getApiBase()}/compile/start`);
   console.log('Board:', board);
   console.log(

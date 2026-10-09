@@ -33,7 +33,13 @@ import {
 import { stripBrandPrefix } from '../../utils/exampleToBuildNetlistInput';
 import { SdCardPanel } from './SdCardPanel';
 import type { UploadedSdFile } from '../../utils/sdCardFiles';
-import { useSimulatorStore } from '../../store/useSimulatorStore';
+import {
+  useSimulatorStore,
+  projectComponentProperties,
+  commitSensorProjectValue,
+} from '../../store/useSimulatorStore';
+import { sensorProjectFields } from '../../simulation/sensorControlConfig';
+import { SensorProjectFields } from './SensorProjectFields';
 import {
   isKeyBindable,
   isModifierKey,
@@ -56,6 +62,7 @@ import {
   type PinLayoutResult,
 } from '../../utils/pinInspectorLayout';
 import { showConfirmDialog } from '../../store/useMessageDialogStore';
+import { scalableSvgThumbnail } from '../../utils/svgThumbnail';
 // The keybind chips and the SD Card panel keep their existing class names and
 // styles — both live in ComponentPropertyDialog.css, imported here so the old
 // dialog file can eventually retire without orphaning them.
@@ -132,7 +139,8 @@ interface PartInspectorDialogProps {
   /** The simulation is running: the part can be inspected (pins, datasheet,
       the SD card's live contents) but not edited. Rotate/Delete are hidden
       and the property editors are disabled; the canvas already withholds
-      onPinSelect so pins are labels, not wire starts. */
+      onPinSelect so pins are labels, not wire starts. A sensor's project
+      values stay editable: the running part takes them at once. */
   readOnly?: boolean;
 }
 
@@ -170,6 +178,9 @@ export const PartInspectorDialog: React.FC<PartInspectorDialogProps> = ({
   const { t } = useTranslation();
   const dialogRef = useRef<HTMLDivElement>(null);
   const previewHostRef = useRef<HTMLDivElement>(null);
+  // Header thumbnail of a part with no SVG art: a second, small instance of
+  // the live element (filled in by the preview effect once it has measured).
+  const thumbHostRef = useRef<HTMLDivElement>(null);
   const [dialogPos, setDialogPos] = useState<{ x: number; y: number } | null>(null);
   const [tab, setTab] = useState<'properties' | 'datasheet'>('properties');
   // The pin the pointer is on — its leader line and dot light up together, so
@@ -260,42 +271,46 @@ export const PartInspectorDialog: React.FC<PartInspectorDialogProps> = ({
       pinInfo?: Array<{ name: string; x: number; y: number; signals?: any[] }>;
     };
     const tag = previewTagName || metaRef.current.tagName;
-    let el: PreviewEl | null = null;
-    if (tag && customElements.get(tag)) {
-      el = document.createElement(tag) as PreviewEl;
-      // Apply the instance's properties (an LED's color/flip changes both the
-      // art and, for flip, the pinInfo itself), then the metadata defaults for
-      // whatever the instance does not carry.
-      for (const [k, v] of Object.entries({
-        ...metaRef.current.defaultValues,
-        ...componentProperties,
-      })) {
-        try {
-          (el as any)[k] = v;
-        } catch {
-          /* read-only prop on some element - ignore */
+    const makeElement = (): PreviewEl | null => {
+      if (tag && customElements.get(tag)) {
+        const made = document.createElement(tag) as PreviewEl;
+        // Apply the instance's properties (an LED's color/flip changes both the
+        // art and, for flip, the pinInfo itself), then the metadata defaults for
+        // whatever the instance does not carry.
+        for (const [k, v] of Object.entries({
+          ...metaRef.current.defaultValues,
+          ...componentProperties,
+        })) {
+          try {
+            (made as any)[k] = v;
+          } catch {
+            /* read-only prop on some element - ignore */
+          }
         }
+        // Boards select their art through an ATTRIBUTE (board-kind), not a
+        // property: velxio-esp32 renders nothing until it has one.
+        for (const [k, v] of Object.entries(previewAttributes ?? {})) made.setAttribute(k, v);
+        return made;
       }
-      // Boards select their art through an ATTRIBUTE (board-kind), not a
-      // property: velxio-esp32 renders nothing until it has one.
-      for (const [k, v] of Object.entries(previewAttributes ?? {})) el!.setAttribute(k, v);
-    } else {
       // Not a registered custom element. The Pi Linux family draws on the
       // canvas as a plain <img> React wrapper carrying pinInfo as a JS
       // property — so the old "unregistered tag → give up" path showed the
       // Pi 3/4/5 inspector with NO pins at all. Clone the live canvas node
       // instead: same art, same natural size, pins from the pinInfo prop.
       const live = document.getElementById(componentId);
-      if (live) {
-        el = live.cloneNode(true) as HTMLElement;
-        el.removeAttribute('id');
-        // Neutralize the canvas placement so the clone lays out at its
-        // natural size inside the preview box.
-        el.style.position = 'static';
-        el.style.left = '';
-        el.style.top = '';
-      }
-    }
+      if (!live) return null;
+      const clone = live.cloneNode(true) as HTMLElement;
+      clone.removeAttribute('id');
+      // Neutralize the canvas placement so the clone lays out at its
+      // natural size inside the preview box.
+      clone.style.position = 'static';
+      clone.style.left = '';
+      clone.style.top = '';
+      return clone;
+    };
+    const el = makeElement();
+    const thumbHost = thumbHostRef.current;
+    if (thumbHost) thumbHost.textContent = '';
     if (!el) {
       // No element and no live node: the header thumbnail already shows the
       // art, so the preview just reports there is nothing live to mount.
@@ -346,6 +361,23 @@ export const PartInspectorDialog: React.FC<PartInspectorDialogProps> = ({
         : `scale(${result.scale})`;
       pel.style.transformOrigin = 'top left';
       setLayout(result);
+      if (thumbHost && !thumbHost.firstChild) paintThumb(w, h);
+    };
+
+    // The header thumbnail, for a part whose metadata has no SVG art: the same
+    // element again, scaled to fit the 40px box and centred in it. It has the
+    // same properties as the preview, so the preview's measured size is its.
+    const paintThumb = (w: number, h: number) => {
+      const t = makeElement();
+      if (!t || !thumbHost) return;
+      const box = thumbHost.clientWidth || 40;
+      const s = Math.min(box / w, box / h);
+      t.classList.add('pid-thumb-element');
+      t.style.transform = `scale(${s})`;
+      t.style.transformOrigin = 'top left';
+      t.style.left = `${(box - w * s) / 2}px`;
+      t.style.top = `${(box - h * s) / 2}px`;
+      thumbHost.appendChild(t);
     };
     requestAnimationFrame(measure);
 
@@ -356,6 +388,7 @@ export const PartInspectorDialog: React.FC<PartInspectorDialogProps> = ({
       cancelled = true;
       pel.removeEventListener('pininfo-change', onPinsChange);
       host.textContent = '';
+      if (thumbHost) thumbHost.textContent = '';
     };
     // propsKey/pinsKey stand in for componentProperties/pinInfo: a real change
     // (a colour edit, an LED flip) changes the digest and repaints; a bare
@@ -462,18 +495,40 @@ export const PartInspectorDialog: React.FC<PartInspectorDialogProps> = ({
     pro_only: componentMetadata.pro_only,
   };
 
-  const svgThumb =
-    componentMetadata.thumbnail && componentMetadata.thumbnail.trim().startsWith('<svg')
-      ? componentMetadata.thumbnail
-      : null;
+  // The art scaled to the header's 40px box (scalableSvgThumbnail adds the
+  // viewBox the catalogue's 64px drawings leave out, which cropped them).
+  // Drawn as an image, never as inline markup: an SVG inside <img> cannot run
+  // script or reach the page, so a thumbnail from any source is inert.
+  const svgThumbMarkup = scalableSvgThumbnail(componentMetadata.thumbnail);
+  const svgThumb = svgThumbMarkup
+    ? `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svgThumbMarkup)}`
+    : null;
 
   // Same http(s)-only guard the picker card applies — docs are a surface the
   // pro overlay can write to, so the validation is load-bearing.
   const buyHref = safeHref(doc?.buy);
 
-  const editableProps = componentMetadata.properties.filter((p: any) => isEditable(p));
+  // A sensor's project values (the sliders of its panel), from the control
+  // definition itself. They replace any metadata entry for the same property
+  // (the DS3231's plain number box, the IR remote's text), which had no range
+  // or unit. Read from the project's properties: a live value a running part
+  // mirrored in is not a project value.
+  const sensorFields = sensorProjectFields({
+    id: componentId,
+    metadataId: componentMetadata.id,
+    properties: projectComponentProperties(componentId) ?? componentProperties,
+  });
+  const sensorProps = new Set(sensorFields.map((f) => f.property));
+  const textSensorProps = new Set(
+    componentMetadata.properties
+      .filter((p: any) => sensorProps.has(p.name) && p.type === 'string')
+      .map((p: any) => p.name as string),
+  );
+  const editableProps = componentMetadata.properties.filter(
+    (p: any) => isEditable(p) && !sensorProps.has(p.name),
+  );
   const readOnlyProps = componentMetadata.properties.filter(
-    (p: any) => !isEditable(p) && !HIDDEN_PROPS.has(p.name),
+    (p: any) => !isEditable(p) && !HIDDEN_PROPS.has(p.name) && !sensorProps.has(p.name),
   );
 
   const pinTitle = (name: string, description?: string) => {
@@ -496,7 +551,13 @@ export const PartInspectorDialog: React.FC<PartInspectorDialogProps> = ({
     >
       {/* Header: art + name + badges + brand, like the picker card. */}
       <div className="pid-header">
-        {svgThumb && <div className="pid-thumb" dangerouslySetInnerHTML={{ __html: svgThumb }} />}
+        {svgThumb ? (
+          <div className="pid-thumb">
+            <img src={svgThumb} alt="" draggable={false} />
+          </div>
+        ) : (
+          <div className="pid-thumb pid-thumb--live" ref={thumbHostRef} aria-hidden="true" />
+        )}
         <div className="pid-title">
           <span className="pid-name">{componentMetadata.name}</span>
           <span className="pid-badges">
@@ -534,7 +595,9 @@ export const PartInspectorDialog: React.FC<PartInspectorDialogProps> = ({
             />
             {previewFailed && !svgThumb && <div className="pid-preview-missing">—</div>}
             {previewFailed && svgThumb && (
-              <div className="pid-preview-fallback" dangerouslySetInnerHTML={{ __html: svgThumb }} />
+              <div className="pid-preview-fallback">
+                <img src={svgThumb} alt="" draggable={false} />
+              </div>
             )}
 
             {/* Pin markers + labels, at their true positions. */}
@@ -677,6 +740,20 @@ export const PartInspectorDialog: React.FC<PartInspectorDialogProps> = ({
                 );
               })}
 
+              {/* Sensor project values. Editable while running too: an
+                  edit here is a project edit, and the running part gets it at
+                  once (commitSensorProjectValue). */}
+              <SensorProjectFields
+                title={t('editor.inspector.sensorValues')}
+                hint={t('editor.inspector.sensorValuesHint')}
+                fields={sensorFields}
+                textProperties={textSensorProps}
+                onChange={(field, stored) => {
+                  onPropertyChange?.(componentId, field.property, stored);
+                  commitSensorProjectValue(componentId, field.key);
+                }}
+              />
+
               {/* Custom chip attribute defaults — declared in chip.json's
                   `attributes`, read by the chip via vx_attr_read. These are
                   the design-time values; live tweaking during a run happens
@@ -791,14 +868,15 @@ export const PartInspectorDialog: React.FC<PartInspectorDialogProps> = ({
 
               {/* microSD upload panel: the standalone card and any part that
                   declares its own TF slot (metadata.sdSlot). For a board
-                  (sdSlot) the componentId IS the board id, which lets the
-                  panel read the live card off that board's bridge; the
-                  standalone card falls back to the active board inside. */}
+                  (sdSlot) the componentId IS the board id. For a card on the
+                  canvas it names the card itself, so the listing comes from
+                  THAT card's model even when the canvas holds two of them. */}
               {(componentMetadata.id === 'microsd-card' || componentMetadata.sdSlot === true) && (
                 <SdCardPanel
                   files={(componentProperties.sdFiles as UploadedSdFile[] | undefined) ?? []}
                   onChange={(next) => onPropertyChange?.(componentId, 'sdFiles', next)}
                   boardId={componentMetadata.sdSlot === true ? componentId : undefined}
+                  componentId={componentMetadata.sdSlot === true ? undefined : componentId}
                 />
               )}
 

@@ -250,3 +250,187 @@ def test_flat_layout_resolves_through_utility(c: ESPIDFCompiler, tmp_path: Path)
         "utility/helper.h": "// the other root a flat library gets\n",
     })
     assert c._walk_library_includes(lib, False, _accept_all) == []
+
+
+# ── A library the user configures ────────────────────────────────────────
+# LVGL wants an lv_conf.h, TFT_eSPI a User_Setup.h, NimBLE a nimconfig.h: the
+# user writes the header, the LIBRARY includes it, and arduino-cli makes that
+# work by putting the sketch folder on the include path of every translation
+# unit. A project with its own lv_conf.h died on "LV_MEM_SIZE >= 2kB is
+# required" with the file sitting right there, unread (issue #352). Three
+# things were wrong, and all three are this shape rather than LVGL's.
+
+def test_an_installed_library_is_not_fetched_from_the_registry_as_well(
+    c: ESPIDFCompiler,
+) -> None:
+    """One library, one copy.
+
+    `lvgl/lvgl` in the registry and the LVGL the user installed from the
+    Library Manager are the same project. With both in the build the sketch's
+    `#include <lvgl.h>` resolves to whichever include root comes first while
+    the project's lv_conf.h configures the other one.
+    """
+    deps = {'lvgl/lvgl': '*', 'espressif/esp32-camera': '*'}
+    merged = {'lvgl.h': 'lvgl'}  # header -> library folder, as the resolver reports
+    kept = c._without_merged_duplicates(deps, merged)
+    assert 'lvgl/lvgl' not in kept, 'the installed library wins'
+    assert kept['espressif/esp32-camera'] == '*', 'nobody installed that one'
+
+
+def test_a_registry_component_survives_when_no_library_provides_it(
+    c: ESPIDFCompiler,
+) -> None:
+    deps = {'lvgl/lvgl': '*'}
+    assert c._without_merged_duplicates(deps, {}) == deps
+    assert c._without_merged_duplicates(deps, None) == deps
+    assert c._without_merged_duplicates(deps, {'Wire.h': 'Wire'}) == deps
+
+
+@pytest.mark.parametrize(
+    "dep, reported",
+    [
+        ('lvgl/lvgl', 'LVGL'),          # registry lowercase, properties uppercase
+        ('someone/my-lib', 'My Lib'),   # dashes in one, spaces in the other
+        ('someone/my_lib', 'my-lib'),
+    ],
+)
+def test_library_name_matching_survives_spelling(
+    c: ESPIDFCompiler, dep: str, reported: str
+) -> None:
+    """Registry names, folder names and library.properties names disagree
+    about case, dashes and spaces; the same project is still one copy."""
+    assert c._without_merged_duplicates({dep: '*'}, {'x.h': reported}) == {}
+
+
+def test_the_project_config_header_beats_the_idf_kconfig(c: ESPIDFCompiler) -> None:
+    """A library that finds a Kconfig prefers it — right on a real IDF
+    project, wrong for an Arduino library the user configured by hand. The
+    escape hatch is the library's own, and it is spent only when the project
+    actually ships the header."""
+    assert 'lv_conf.h' in c._ARDUINO_CONFIG_WINS
+    assert c._ARDUINO_CONFIG_WINS['lv_conf.h'] == ('LV_KCONFIG_IGNORE',)
+    # Every switch names a macro the library documents, never a source patch.
+    for header, macros in c._ARDUINO_CONFIG_WINS.items():
+        assert header.endswith('.h')
+        assert macros and all(m.isidentifier() for m in macros)
+
+
+# ── A scoped compile's retry must not reach for other users' libraries ────
+# The retry used to re-resolve the whole include graph against every library on
+# the server, by file name, first match wins — and then report ITS error as the
+# sketch's. A user declaring LovyanGFX, TJpg_Decoder, WiFiManager and lvgl was
+# shown a build failure from inside `evive`, an AVR library someone else had
+# installed (issue #352). Same shape as Hash.h -> stemihexapod before it.
+
+def _lib(root: Path, folder: str, *, props: str = '', files: dict[str, str] | None = None) -> Path:
+    d = root / folder
+    (d / 'src').mkdir(parents=True)
+    if props:
+        (d / 'library.properties').write_text(props)
+    for name, body in (files or {}).items():
+        (d / 'src' / name).write_text(body)
+    return d
+
+
+EVIVE_H = """#ifndef EVIVE_H
+#define EVIVE_H
+#include <Arduino.h>
+#include <util/delay.h>
+#endif
+"""
+
+
+def test_an_unconditional_avr_include_marks_a_library_that_cannot_build_here(
+    c: ESPIDFCompiler, tmp_path: Path
+) -> None:
+    """An include guard wraps the whole header on every platform, so the AVR
+    include inside it is as unconditional as a line can be."""
+    lib = _lib(tmp_path, 'evive', props='name=evive\narchitectures=*\n',
+               files={'evive.h': EVIVE_H})
+    assert c._foreign_platform_include(lib) == 'util/delay.h'
+    assert c._library_supports_esp32(lib) is False
+
+
+def test_a_guarded_avr_include_is_how_a_portable_library_looks(
+    c: ESPIDFCompiler, tmp_path: Path
+) -> None:
+    body = '#ifndef P_H\n#define P_H\n#ifdef __AVR__\n#include <avr/pgmspace.h>\n#endif\n#endif\n'
+    lib = _lib(tmp_path, 'portable', props='name=portable\n', files={'p.h': body})
+    assert c._foreign_platform_include(lib) is None
+    assert c._library_supports_esp32(lib) is True
+
+
+def test_a_library_that_names_esp32_is_trusted_as_written(
+    c: ESPIDFCompiler, tmp_path: Path
+) -> None:
+    lib = _lib(tmp_path, 'claims', props='name=claims\narchitectures=esp32\n',
+               files={'c.h': EVIVE_H})
+    assert c._library_supports_esp32(lib) is True
+
+
+def _universe(c: ESPIDFCompiler, tmp_path: Path, monkeypatch) -> Path:
+    libs = tmp_path / 'libraries'
+    libs.mkdir()
+    monkeypatch.setattr(c, '_find_arduino_libraries_dir', lambda: libs)
+    c._foreign_include_cache.clear()
+    return libs
+
+
+def test_the_retry_never_picks_a_library_that_cannot_build_for_esp32(
+    c: ESPIDFCompiler, tmp_path: Path, monkeypatch
+) -> None:
+    libs = _universe(c, tmp_path, monkeypatch)
+    _lib(libs, 'evive', props='name=evive\narchitectures=*\n',
+         files={'Button.h': EVIVE_H, 'evive.h': EVIVE_H})
+    chosen, why = c._libraries_for_missing_headers(['Button.h'], {'lvgl'})
+    assert chosen == set()
+    assert why['Button.h']['chosen'] is None
+    assert [n for n, _ in why['Button.h']['rejected']] == ['evive']
+    assert 'util/delay.h' in why['Button.h']['rejected'][0][1]
+
+
+def test_a_declared_librarys_depends_decides_between_candidates(
+    c: ESPIDFCompiler, tmp_path: Path, monkeypatch
+) -> None:
+    libs = _universe(c, tmp_path, monkeypatch)
+    _lib(libs, 'TFT_UI', props='name=TFT_UI\ndepends=Widget Kit (>=1.0)\n',
+         files={'TFT_UI.h': '#include <Widget.h>\n'})
+    _lib(libs, 'WidgetKit', props='name=Widget Kit\n', files={'Widget.h': ''})
+    _lib(libs, 'SomeoneElse', props='name=SomeoneElse\n', files={'Widget.h': ''})
+    chosen, why = c._libraries_for_missing_headers(['Widget.h'], {'TFT_UI'})
+    assert chosen == {'Widget Kit'}, 'the author said so in depends='
+
+
+def test_a_header_named_after_a_library_picks_that_library(
+    c: ESPIDFCompiler, tmp_path: Path, monkeypatch
+) -> None:
+    libs = _universe(c, tmp_path, monkeypatch)
+    _lib(libs, 'TJpg_Decoder', props='name=TJpg_Decoder\n', files={'TJpg_Decoder.h': ''})
+    _lib(libs, 'JpgBundle', props='name=JpgBundle\n', files={'TJpg_Decoder.h': ''})
+    chosen, _ = c._libraries_for_missing_headers(['TJpg_Decoder.h'], {'lvgl'})
+    assert chosen == {'TJpg_Decoder'}
+
+
+def test_two_unrelated_providers_are_a_question_not_a_guess(
+    c: ESPIDFCompiler, tmp_path: Path, monkeypatch
+) -> None:
+    libs = _universe(c, tmp_path, monkeypatch)
+    _lib(libs, 'ButtonsA', props='name=ButtonsA\n', files={'Button.h': ''})
+    _lib(libs, 'ButtonsB', props='name=ButtonsB\n', files={'Button.h': ''})
+    chosen, why = c._libraries_for_missing_headers(['Button.h'], {'lvgl'})
+    assert chosen == set()
+    assert sorted(why['Button.h']['ambiguous']) == ['ButtonsA', 'ButtonsB']
+
+
+def test_the_error_names_the_missing_header_and_what_almost_provides_it(
+    c: ESPIDFCompiler,
+) -> None:
+    why = {'Button.h': {'chosen': None,
+                        'rejected': [('evive', 'it includes <util/delay.h>, which does not exist for ESP32')],
+                        'ambiguous': []}}
+    out = c._explain_missing_headers({'error': 'fatal error: Button.h: No such file'}, ['Button.h'], why)
+    first = out['error'].splitlines()[0]
+    assert first.startswith('<Button.h>: none of the libraries in this project provides it.')
+    assert 'evive' in first and 'util/delay.h' in first
+    assert 'fatal error: Button.h' in out['error'], 'the compiler line is kept below'
+    assert out['missing_headers'] == ['Button.h']

@@ -11,8 +11,42 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import * as ts from 'typescript';
+import { createRequire } from 'node:module';
+import type * as TS from 'typescript';
 import type { ComponentMetadata, ComponentCategory } from '../frontend/src/types/component-metadata';
+
+/**
+ * The compiler API is only needed to parse the optional
+ * third-party/wokwi-elements clone, so it is loaded on demand rather than
+ * imported at the top: `typescript` lives in the repo root's devDependencies,
+ * which `npm install` in frontend/ does not install, and `npm run dev` runs
+ * this script. A top-level import therefore threw MODULE_NOT_FOUND before the
+ * "no clone, skip regeneration" early return below could fire, breaking dev
+ * for anyone who had not also installed at the root.
+ *
+ * Resolution falls back to frontend/node_modules, which pins the same
+ * typescript version, so the clone path works from either install.
+ *
+ * `createRequire` rather than `await import()`: dynamic import goes through
+ * the ESM resolver, which honours neither NODE_PATH nor a different base.
+ */
+let ts!: typeof TS;
+
+function loadTypeScript(): void {
+  if (ts) return;
+  const bases = [__filename, path.join(__dirname, '../frontend/package.json')];
+  for (const base of bases) {
+    try {
+      ts = createRequire(base)('typescript');
+      return;
+    } catch {
+      // Try the next base.
+    }
+  }
+  throw new Error(
+    "Cannot resolve 'typescript'. Run `npm install` at the repo root (or in frontend/).",
+  );
+}
 
 // Hardcoded category mapping (components don't self-declare categories)
 const CATEGORY_MAP: Record<string, ComponentCategory> = {
@@ -92,6 +126,17 @@ interface ParsedComponent {
   pinCount: number;
 }
 
+/**
+ * The thumbnail of a part with no art of its own: none. It used to be a grey
+ * square with the id printed in it at 10px, and every consumer treats an
+ * `<svg` thumbnail as the part's art, so the property dialog's 40px header
+ * showed the middle of "NTC-TEMPERATURE-SENSOR" ("ERATUR") for the 105
+ * catalogue parts drawn by their element rather than by an SVG. An empty
+ * thumbnail tells the consumers to draw the live element instead, which the
+ * picker card already did for every registered tag.
+ */
+const NO_THUMBNAIL = '';
+
 class MetadataGenerator {
   private wokwiElementsPath: string;
   private outputPath: string;
@@ -123,6 +168,8 @@ class MetadataGenerator {
       console.log('       third-party/wokwi-elements');
       return;
     }
+
+    loadTypeScript();
 
     const components: ComponentMetadata[] = [];
     const elementFiles = this.findElementFiles();
@@ -210,7 +257,7 @@ class MetadataGenerator {
         continue;
       }
       components.push({
-        thumbnail: custom.thumbnail ?? this.generateThumbnailPlaceholder(custom.id),
+        thumbnail: custom.thumbnail ?? NO_THUMBNAIL,
         tags: custom.tags ?? this.generateTags(custom.id, custom.name || custom.id),
         properties: custom.properties ?? [],
         defaultValues: custom.defaultValues ?? {},
@@ -324,7 +371,7 @@ class MetadataGenerator {
       name: storiesMetadata?.name || this.formatName(id),
       category,
       description: storiesMetadata?.description,
-      thumbnail: this.generateThumbnailPlaceholder(id),
+      thumbnail: NO_THUMBNAIL,
       properties: parsed.properties.map(prop => ({
         name: prop.name,
         type: this.mapPropertyType(prop.type),
@@ -340,16 +387,16 @@ class MetadataGenerator {
   /**
    * Parse TypeScript AST to extract decorators and properties
    */
-  private parseTypeScriptAST(sourceFile: ts.SourceFile): ParsedComponent | null {
+  private parseTypeScriptAST(sourceFile: TS.SourceFile): ParsedComponent | null {
     let tagName = '';
     let className = '';
     const properties: ParsedComponent['properties'] = [];
     let pinCount = 0;
 
-    const visit = (node: ts.Node) => {
+    const visit = (node: TS.Node) => {
       // Find @customElement decorator
       if (ts.isDecorator(node)) {
-        const decorator = node as ts.Decorator;
+        const decorator = node as TS.Decorator;
         if (ts.isCallExpression(decorator.expression)) {
           const call = decorator.expression;
           if (ts.isIdentifier(call.expression) && call.expression.text === 'customElement') {
@@ -479,17 +526,6 @@ class MetadataGenerator {
       }
     });
     return defaults;
-  }
-
-  private generateThumbnailPlaceholder(id: string): string {
-    // For now, return a simple SVG placeholder
-    // TODO: Extract actual SVG from render() method
-    return `<svg width="64" height="64" xmlns="http://www.w3.org/2000/svg">
-      <rect width="64" height="64" fill="#e0e0e0" rx="4"/>
-      <text x="50%" y="50%" text-anchor="middle" dy=".3em" font-size="10" fill="#666">
-        ${id.toUpperCase()}
-      </text>
-    </svg>`;
   }
 
   private generateTags(id: string, name: string): string[] {
