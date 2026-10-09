@@ -670,12 +670,17 @@ class ArduinoCLIService:
                     cmd.insert(3, fqbn_dio)
                     cmd = cmd[:4]  # trim accidental duplicates
                     cmd = [self.cli_path, "compile", "--fqbn", fqbn_dio,
+                           # Do NOT override build.extra_flags: on ESP32 core 3.x it
+                           # carries -DESP32=ESP32 (and other core defines), and
+                           # replacing it makes libraries like Adafruit_NeoPixel
+                           # fail with "#error Architecture not supported".
+                           # compiler.*.extra_flags are append-only hooks.
                            "--build-property",
-                           "build.extra_flags=-DARDUINO_ESP32_LCGAMBOA=1",
+                           "compiler.c.extra_flags=-DARDUINO_ESP32_LCGAMBOA=1",
                            # Adafruit_BusIO 1.17.x dropped BitOrder on ESP32 3.x;
                            # this define restores it as uint8_t (the type it was).
                            "--build-property",
-                           "compiler.cpp.extra_flags=-DBitOrder=uint8_t",
+                           "compiler.cpp.extra_flags=-DARDUINO_ESP32_LCGAMBOA=1 -DBitOrder=uint8_t",
                            "--output-dir", str(build_dir),
                            str(sketch_dir)]
                 else:
