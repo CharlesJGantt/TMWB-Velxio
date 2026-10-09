@@ -8,6 +8,6 @@
 #
 # To adopt a newer upstream deliberately: merge upstream into this fork, test
 # locally, then update the digest below (see deploy/README.md).
-FROM ghcr.io/davidmonterocrespo24/velxio:master@sha256:35adfc789fe4da0cd8ad3927d4da1345596f08ec70be88d19cc523361690e5fc
+FROM ghcr.io/davidmonterocrespo24/velxio:master@sha256:b4ae436bf5e2e17a62741d9b5ca8b0a3849374981aaa0dc9992aa58164733c5b
 
 COPY frontend-dist/ /usr/share/nginx/html/
