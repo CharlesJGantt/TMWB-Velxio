@@ -860,6 +860,11 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
         SIG_LEDC_LS_CH_LAST = sys.modules['esp32_signals'].SIG_LEDC_LS_CH_LAST
         rmt_signal_base = sys.modules['esp32_signals'].rmt_signal_base
     _signal_router = SignalRouter()
+    # Routes already announced to the frontend as `gpio_routing` events.
+    # Kept separate from `_signal_router` on purpose: `_on_gpio_matrix` updates
+    # the router synchronously, so the router alone cannot tell the poll what
+    # still needs to be emitted.
+    _emitted_routes: dict[int, int] = {}
     _rmt_sig_base = rmt_signal_base(machine)
 
     def _gpio_for_rmt_channel(channel: int) -> int | None:
@@ -914,7 +919,19 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                 # can opt in without code changes here.
                 if SIG_LEDC_HS_CH0_OUT_IDX <= signal_id <= SIG_LEDC_LS_CH_LAST:
                     snapshot[gpio_pin] = signal_id
-            changed, cleared = _signal_router.replace_snapshot(snapshot)
+            # Diff against what was last EMITTED. The libqemu GPIO-matrix
+            # callback (_on_gpio_matrix) updates `_signal_router` as soon as
+            # the firmware routes a pin, so by the time this poll runs the
+            # router already equals the chip's table and replace_snapshot()
+            # reports no change. No `gpio_routing` event was ever sent, the
+            # frontend's mirror stayed empty, and every LEDC consumer (servo,
+            # dimmed LED, buzzer) never received its PWM.
+            changed = [(g, sid) for g, sid in snapshot.items()
+                       if _emitted_routes.get(g) != sid]
+            cleared = [g for g in _emitted_routes if g not in snapshot]
+            _signal_router.replace_snapshot(snapshot)  # keep the router in sync
+            _emitted_routes.clear()
+            _emitted_routes.update(snapshot)
             for gpio_pin, signal_id in changed:
                 _emit({'type': 'gpio_routing',
                        'gpio': gpio_pin,
