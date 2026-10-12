@@ -475,6 +475,16 @@ export const EditorMenuBar: React.FC = () => {
       {menu('view', t('editor.menu.view', 'View'), viewItems)}
       {menu('account', t('editor.menu.account', 'Account'), [])}
       {menu('help', t('editor.menu.help', 'Help'), helpItems)}
+      {/* Top-level shortcut to the examples gallery. It also lives under
+          Help; opens in a new tab so the project being edited is untouched. */}
+      <a
+        className="emb-trigger emb-trigger-link"
+        href="/examples"
+        target="_blank"
+        rel="noopener noreferrer"
+      >
+        {t('header.nav.examples', 'Examples')}
+      </a>
     </div>
   );
 };

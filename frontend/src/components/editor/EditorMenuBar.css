@@ -110,3 +110,9 @@
   flex-shrink: 0;
   margin-left: 8px;
 }
+
+/* Top-level Examples link: same look as the menu triggers, but an anchor. */
+a.emb-trigger-link {
+  display: inline-block;
+  text-decoration: none;
+}
